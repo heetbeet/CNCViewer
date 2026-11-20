@@ -1467,9 +1467,8 @@ impl App {
             }
         }
         if self.popup > 0 {
-            let h = if self.popup == 2 { 213. } else { 205. };
-            let width: f32 = if self.popup == 2 { 330. } else { 285. };
-            let width = width.min((plot.width() - 8.).max(1.));
+            let h = if self.popup == 2 { 237. } else { 205. };
+            let width = 285_f32.min((plot.width() - 8.).max(1.));
             let rect = Rect::from_min_size(
                 Pos2::new((options.max.x - width).max(plot.min.x + 4.), y - h - 8.),
                 Vec2::new(width, h),
@@ -1531,22 +1530,16 @@ impl App {
             pop.add_space(31.);
             pop.spacing_mut().item_spacing.y = 4.;
             if self.popup == 2 {
-                pop.horizontal(|ui| {
-                    ui.label("Toolbit path");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        pill(ui, &mut self.settings.show_toolbit_path);
-                        ui.checkbox(&mut self.settings.opaque_toolbit_path, "Occlude")
-                            .on_hover_text("Draw the cutter trail as a solid surface");
-                        measurement(
-                            ui,
-                            "Tool diameter",
-                            &mut self.settings.diameter,
-                            0.01..=10000.,
-                            0.1,
-                            "mm",
-                        );
-                    });
-                });
+                toggle(&mut pop, "Depth support", &mut self.settings.depth_support);
+                measured_toggle(
+                    &mut pop,
+                    "Toolbit path",
+                    &mut self.settings.show_toolbit_path,
+                    &mut self.settings.diameter,
+                    0.01..=10000.,
+                    0.1,
+                    "mm",
+                );
                 measured_toggle(
                     &mut pop,
                     "Feed timing",

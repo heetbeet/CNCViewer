@@ -1,5 +1,6 @@
 struct Camera { right:vec4<f32>, up:vec4<f32>, depth:vec4<f32>, flags:vec4<f32> }
 @group(0) @binding(0) var<uniform> camera:Camera;
+const CANVAS = vec3(0.949);
 struct Out { @builtin(position) position:vec4<f32>, @location(0) color:vec4<f32> }
 fn to_clip(p: vec3<f32>) -> vec3<f32> {
     let point=vec4(p,1.0);
@@ -23,7 +24,7 @@ fn path_depth(depth: f32, color: vec4<f32>) -> f32 {
     if is_rapid(input.color) {
         if camera.flags.x < 0.5 { discard; }
         // Keep the subdued rapid color, but give the line an opaque depth sample.
-        return vec4(mix(vec3(0.949), input.color.rgb, input.color.a), 1.0);
+        return vec4(mix(CANVAS, input.color.rgb, input.color.a), 1.0);
     }
     return input.color;
 }
@@ -35,11 +36,62 @@ fn path_depth(depth: f32, color: vec4<f32>) -> f32 {
     return out;
 }
 const TRAIL_COLOR = vec3(0.2784, 0.6314, 0.5176);
+const TRAIL_ALPHA = 0.28;
 @fragment fn fs_trail(input:Out)->@location(0) vec4<f32> {
-    return vec4(TRAIL_COLOR,0.28+input.color.w*0.000001);
+    return vec4(TRAIL_COLOR,TRAIL_ALPHA+input.color.w*0.000001);
 }
-@fragment fn fs_opaque_trail()->@location(0) vec4<f32> {
-    return vec4(TRAIL_COLOR,1.0);
+@fragment fn fs_depth_trail()->@location(0) vec4<f32> {
+    let alpha = 0.70;
+    return vec4(mix(CANVAS, TRAIL_COLOR, TRAIL_ALPHA / alpha), alpha);
+}
+
+@group(0) @binding(1) var scene: texture_2d<f32>;
+@group(0) @binding(2) var scene_depth: texture_depth_multisampled_2d;
+
+@vertex fn vs_halo(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    let triangle = array<vec2<f32>, 3>(vec2(-1.0,-1.0), vec2(3.0,-1.0), vec2(-1.0,3.0));
+    return vec4(triangle[index], 0.0, 1.0);
+}
+
+fn nearest_depth(pixel: vec2<i32>) -> f32 {
+    return min(
+        min(textureLoad(scene_depth, pixel, 0), textureLoad(scene_depth, pixel, 1)),
+        min(textureLoad(scene_depth, pixel, 2), textureLoad(scene_depth, pixel, 3)),
+    );
+}
+
+fn is_depth_edge(center: f32, near: f32, opposite: f32) -> bool {
+    // Leave a smoothly sloped surface alone. Its depth gradient continues
+    // across the pixel, unlike a foreground stroke crossing the surface.
+    let gradient = select(abs(opposite - center), 0.0, opposite == 1.0);
+    return center - near > max(0.000001, 1.5 * gradient);
+}
+
+@fragment fn fs_halo(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let pixel = vec2<i32>(position.xy);
+    let color = textureLoad(scene, pixel, 0);
+    if all(abs(color.rgb - CANVAS) < vec3(0.002)) {
+        return color;
+    }
+    let limit = vec2<i32>(textureDimensions(scene)) - vec2(1);
+    let center = nearest_depth(pixel);
+    var halo = 0.0;
+    for (var axis = 0; axis < 2; axis++) {
+        let step = select(vec2(1, 0), vec2(0, 1), axis == 1);
+        let before = nearest_depth(max(pixel - step, vec2(0)));
+        let after = nearest_depth(min(pixel + step, limit));
+        if is_depth_edge(center, before, after) || is_depth_edge(center, after, before) {
+            halo = 0.55;
+            break;
+        }
+        let before_outer = nearest_depth(max(pixel - 2 * step, vec2(0)));
+        let after_outer = nearest_depth(min(pixel + 2 * step, limit));
+        if is_depth_edge(center, before_outer, after_outer) ||
+           is_depth_edge(center, after_outer, before_outer) {
+            halo = 0.24;
+        }
+    }
+    return vec4(mix(color.rgb, CANVAS, halo), color.a);
 }
 
 @vertex fn vs_point(@location(0) p:vec3<f32>,@location(1) color:vec4<f32>,@builtin(vertex_index) n:u32)->Out {

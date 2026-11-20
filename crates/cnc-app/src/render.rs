@@ -1,4 +1,4 @@
-use crate::{camera::Camera, trail::Mode as TrailMode};
+use crate::camera::Camera;
 use cnc_core::engine::Model;
 use cnc_core::geometry::Point;
 use eframe::wgpu::{self, util::DeviceExt};
@@ -39,7 +39,8 @@ struct LiveVertices {
 pub struct Draw {
     pub rapid: bool,
     pub grid: bool,
-    pub trail: TrailMode,
+    pub trail: bool,
+    pub depth_support: bool,
     pub points: bool,
     pub segments: usize,
     pub live: LiveDraw,
@@ -54,6 +55,11 @@ pub struct PreparedPlot {
     five_axis: bool,
     trail: Option<crate::trail::PreparedTrail>,
     pub trail_error: Option<String>,
+}
+
+struct HaloFrame {
+    color: wgpu::TextureView,
+    bind: wgpu::BindGroup,
 }
 
 pub struct Plot {
@@ -72,6 +78,9 @@ pub struct Plot {
     grid: wgpu::Buffer,
     grid_count: u32,
     depth: wgpu::TextureView,
+    sampled_depth: wgpu::TextureView,
+    halo: wgpu::RenderPipeline,
+    halo_frame: Option<HaloFrame>,
     trail: crate::trail::Trail,
     msaa: wgpu::TextureView,
     last_frame: Option<([f32; 16], Draw)>,
@@ -242,10 +251,38 @@ impl Plot {
         });
         let texture = Self::texture(&device, [1, 1]);
         let view = texture.create_view(&Default::default());
-        let depth = Self::depth(&device, [1, 1]);
+        let (depth, sampled_depth) = Self::depth(&device, [1, 1]);
         let msaa = Self::msaa(&device, [1, 1]);
+        let halo = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Depth halos"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_halo"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_halo"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         Self {
             depth,
+            sampled_depth,
+            halo,
+            halo_frame: None,
             trail,
             msaa,
             last_frame: None,
@@ -273,23 +310,28 @@ impl Plot {
             count: 0,
         }
     }
-    fn depth(device: &wgpu::Device, size: [u32; 2]) -> wgpu::TextureView {
-        device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("Path depth and brush stencil"),
-                size: wgpu::Extent3d {
-                    width: size[0],
-                    height: size[1],
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 4,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Depth24PlusStencil8,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            })
-            .create_view(&Default::default())
+    fn depth(device: &wgpu::Device, size: [u32; 2]) -> (wgpu::TextureView, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Path depth and brush stencil"),
+            size: wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 4,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth24PlusStencil8,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        (
+            texture.create_view(&Default::default()),
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                aspect: wgpu::TextureAspect::DepthOnly,
+                ..Default::default()
+            }),
+        )
     }
     fn msaa(device: &wgpu::Device, size: [u32; 2]) -> wgpu::TextureView {
         device
@@ -509,6 +551,7 @@ impl Plot {
             rapid: show_rapid,
             grid: show_grid,
             trail,
+            depth_support,
             points: show_points,
             segments,
             live,
@@ -516,7 +559,8 @@ impl Plot {
         let size = size.map(|n| n.clamp(1, 8192));
         let changed = size != self.size;
         if changed {
-            self.depth = Self::depth(&self.device, size);
+            (self.depth, self.sampled_depth) = Self::depth(&self.device, size);
+            self.halo_frame = None;
             self.msaa = Self::msaa(&self.device, size);
             self.texture = Self::texture(&self.device, size);
             self.view = self.texture.create_view(&Default::default());
@@ -550,6 +594,25 @@ impl Plot {
             return false;
         }
         self.last_frame = Some(signature);
+        if depth_support && self.halo_frame.is_none() {
+            let color = Self::texture(&self.device, size).create_view(&Default::default());
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Depth halo inputs"),
+                layout: &self.halo.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&color),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.sampled_depth),
+                    },
+                ],
+            });
+            self.halo_frame = Some(HaloFrame { color, bind });
+        }
+        let halo = self.halo_frame.as_ref().filter(|_| depth_support);
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::cast_slice(&uniform));
         if live.motion.is_some() || live.tool.is_some() {
@@ -563,7 +626,7 @@ impl Plot {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.msaa,
                     depth_slice: None,
-                    resolve_target: Some(&self.view),
+                    resolve_target: Some(halo.map_or(&self.view, |frame| &frame.color)),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.949,
@@ -578,7 +641,11 @@ impl Plot {
                     view: &self.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.),
-                        store: wgpu::StoreOp::Discard,
+                        store: if depth_support {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
                     }),
                     stencil_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(0),
@@ -632,11 +699,31 @@ impl Plot {
                 pass.set_vertex_buffer(0, self.live.slice(tool_start..));
                 pass.draw(0..6, 0..1);
             }
-            match trail {
-                TrailMode::Hidden => {}
-                TrailMode::Transparent => self.trail.draw(&mut pass, segments),
-                TrailMode::Opaque => self.trail.draw_opaque(&mut pass, segments),
+            if trail {
+                if depth_support {
+                    self.trail.draw_depth_supported(&mut pass, segments);
+                } else {
+                    self.trail.draw(&mut pass, segments);
+                }
             }
+        }
+        if let Some(halo) = halo {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Depth halos"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.halo);
+            pass.set_bind_group(0, &halo.bind, &[]);
+            pass.draw(0..3, 0..1);
         }
         self.queue.submit([encoder.finish()]);
         changed
@@ -744,7 +831,8 @@ mod tests {
                 Draw {
                     rapid: false,
                     grid: true,
-                    trail: TrailMode::Hidden,
+                    trail: false,
+                    depth_support: false,
                     points: false,
                     segments: 0,
                     live: Default::default(),
@@ -798,7 +886,8 @@ mod tests {
                 Draw {
                     rapid: false,
                     grid: false,
-                    trail: TrailMode::Hidden,
+                    trail: false,
+                    depth_support: false,
                     points: false,
                     segments: model.segments.len(),
                     live: Default::default(),
@@ -871,7 +960,8 @@ mod tests {
         let mut draw = Draw {
             rapid: true,
             grid: false,
-            trail: TrailMode::Hidden,
+            trail: false,
+            depth_support: false,
             points: false,
             segments: model.segments.len(),
             live: Default::default(),
@@ -925,27 +1015,31 @@ mod tests {
         draw.live = Default::default();
         draw.segments = model.segments.len();
         let exposed = render(&mut plot, "bottom", draw);
-        draw.trail = TrailMode::Transparent;
+        draw.trail = true;
         let tinted = render(&mut plot, "top", draw);
         assert!(
             u16::from(tinted[1]) > u16::from(exposed[1]) + 8,
             "Front trail should tint the cut: {tinted:?}"
         );
         assert_eq!(render(&mut plot, "bottom", draw), exposed);
-        draw.trail = TrailMode::Opaque;
-        let solid = render(&mut plot, "top", draw);
-        assert_eq!(solid, [71, 161, 132]);
+        draw.depth_support = true;
+        let muted = render(&mut plot, "top", draw);
+        assert!(
+            muted[0] > tinted[0] && muted[0] < 194 && muted[2] > 211,
+            "The blue cut should stay visible through the pale green sweep: {muted:?}"
+        );
         assert_eq!(render(&mut plot, "bottom", draw), exposed);
         let upper_cut = model.segments.len() - 1;
         plot.partial_trail(Some((&model.segments[upper_cut], upper_cut, 0.75)));
         draw.segments = upper_cut;
-        assert_eq!(render(&mut plot, "top", draw), solid);
+        assert_eq!(render(&mut plot, "top", draw), muted);
         assert_eq!(render(&mut plot, "bottom", draw), exposed);
 
         model = program("G0 X20 Y0 Z5\nG1 X40 F100\nG0 Y20\nX20\nM30\n");
         plot.load(&model).unwrap();
         draw.rapid = true;
-        draw.trail = TrailMode::Hidden;
+        draw.trail = false;
+        draw.depth_support = false;
         draw.points = false;
         draw.segments = model.segments.len();
         assert_eq!(render(&mut plot, "front", draw), bottom);
@@ -961,59 +1055,126 @@ mod tests {
     }
 
     #[test]
-    fn continuous_brush_is_uniform_and_separate_coats_cap_at_two() {
-        let mut plot = headless().expect("Native graphics adapter");
-        let mut sample = |source: &str, offset: u32, sample: Option<(usize, f64)>| {
-            let model = cnc_core::engine::inspect(
-                source,
-                "brush.nc",
-                &Default::default(),
-                &Default::default(),
-            )
-            .unwrap();
-            assert_eq!(model.status, "complete");
-            plot.load(&model).unwrap();
-            plot.trail(&model, 8.).unwrap();
-            plot.partial_trail(
-                sample.map(|(index, fraction)| (&model.segments[index], index, fraction)),
-            );
+    fn depth_halo_separates_the_axis_and_cut_in_camera_order() {
+        let mut plot = headless().unwrap();
+        let model = cnc_core::engine::inspect(
+            "G0 X-8 Y5 Z-4\nG1 X8 F100\nM30",
+            "axis-crossing.nc",
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        plot.load(&model).unwrap();
+        let path = std::env::temp_dir().join(format!("cnc-halo-{}.png", std::process::id()));
+        let mut render = |view, depth_support| {
             let mut camera = Camera::default();
-            camera.view("top");
-            camera.center = [10., 0., 0.];
-            camera.scale = 0.1;
+            camera.view(view);
+            camera.center = [0., 5., -2.];
+            camera.scale = 0.25;
             plot.render(
-                [256, 128],
+                [64, 64],
                 1.,
                 &camera,
                 Draw {
                     rapid: false,
                     grid: false,
-                    trail: TrailMode::Transparent,
+                    trail: false,
+                    depth_support,
                     points: false,
-                    segments: sample.map_or(model.segments.len(), |(index, _)| index),
+                    segments: model.segments.len(),
                     live: Default::default(),
                 },
             );
-            let path =
-                std::env::temp_dir().join(format!("cnc-brush-{}-{offset}.png", std::process::id()));
             plot.png(&path).unwrap();
-            let decoder = png::Decoder::new(std::io::BufReader::new(File::open(&path).unwrap()));
-            let mut reader = decoder.read_info().unwrap();
-            let mut data = vec![0; reader.output_buffer_size().unwrap()];
-            reader.next_frame(&mut data).unwrap();
-            std::fs::remove_file(path).unwrap();
-            let i = (68 * 256 + 128) * 4;
-            [data[i], data[i + 80 * 4]]
+            let mut reader = png::Decoder::new(std::io::BufReader::new(File::open(&path).unwrap()))
+                .read_info()
+                .unwrap();
+            let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+            reader.next_frame(&mut pixels).unwrap();
+            pixels
         };
-        let single = sample("G0X0Y0Z0\nG1X20F100\nM30", 0, None);
-        let joined = sample("G0X0Y0Z0\nG1X20F100\nG1X0\nM30", 1, None);
-        let twice = sample("G0X0Y0Z0\nG1X20F100\nG0X0\nG1X20\nM30", 2, None);
+        let top = render("top", false);
+        let halo = render("top", true);
+        let bottom = render("bottom", false);
+        let bottom_halo = render("bottom", true);
+        std::fs::remove_file(path).unwrap();
+        let strongest_blue = |image: &[u8], x: usize| {
+            (30_usize..34)
+                .map(|y| {
+                    let i = (y * 64 + x) * 4;
+                    image[i + 2].saturating_sub(image[i])
+                })
+                .max()
+                .unwrap()
+        };
+        assert!(strongest_blue(&top, 34) > strongest_blue(&halo, 34) + 15);
+        assert_eq!(strongest_blue(&top, 38), strongest_blue(&halo, 38));
+        assert_eq!(
+            strongest_blue(&bottom, 34),
+            strongest_blue(&bottom_halo, 34)
+        );
+        assert_ne!(bottom, bottom_halo, "The nearer cut should soften the axis");
+    }
+
+    #[test]
+    fn continuous_brush_is_uniform_and_separate_coats_cap_at_two() {
+        let mut plot = headless().expect("Native graphics adapter");
+        let mut sample =
+            |source: &str, offset: u32, sample: Option<(usize, f64)>, depth_support| {
+                let model = cnc_core::engine::inspect(
+                    source,
+                    "brush.nc",
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .unwrap();
+                assert_eq!(model.status, "complete");
+                plot.load(&model).unwrap();
+                plot.trail(&model, 8.).unwrap();
+                plot.partial_trail(
+                    sample.map(|(index, fraction)| (&model.segments[index], index, fraction)),
+                );
+                let mut camera = Camera::default();
+                camera.view("top");
+                camera.center = [10., 0., 0.];
+                camera.scale = 0.1;
+                plot.render(
+                    [256, 128],
+                    1.,
+                    &camera,
+                    Draw {
+                        rapid: false,
+                        grid: false,
+                        trail: true,
+                        depth_support,
+                        points: false,
+                        segments: sample.map_or(model.segments.len(), |(index, _)| index),
+                        live: Default::default(),
+                    },
+                );
+                let path = std::env::temp_dir()
+                    .join(format!("cnc-brush-{}-{offset}.png", std::process::id()));
+                plot.png(&path).unwrap();
+                let decoder =
+                    png::Decoder::new(std::io::BufReader::new(File::open(&path).unwrap()));
+                let mut reader = decoder.read_info().unwrap();
+                let mut data = vec![0; reader.output_buffer_size().unwrap()];
+                reader.next_frame(&mut data).unwrap();
+                std::fs::remove_file(path).unwrap();
+                let i = (68 * 256 + 128) * 4;
+                [i, i + 80 * 4].map(|i| [data[i], data[i + 1], data[i + 2]])
+            };
+        let line = "G0X0Y0Z0\nG1X20F100\nM30";
+        let single = sample(line, 0, None, false);
+        let joined = sample("G0X0Y0Z0\nG1X20F100\nG1X0\nM30", 1, None, false);
+        let twice = sample("G0X0Y0Z0\nG1X20F100\nG0X0\nG1X20\nM30", 2, None, false);
         let third = sample(
             "G0X0Y0Z0\nG1X20F100\nG0X0\nG1X20\nG0X0\nG1X20\nM30",
             3,
             None,
+            false,
         );
-        let partial = sample("G0X0Y0Z0\nG1X20F100\nM30", 4, Some((0, 0.5)));
+        let partial = sample(line, 4, Some((0, 0.5)), false);
         assert_eq!(
             partial[0], single[0],
             "Partial sweep must color the reached cutter position"
@@ -1025,5 +1186,16 @@ mod tests {
         );
         assert!(twice[0] < single[0], "A separate pass must add a coat");
         assert_eq!(twice, third, "A third pass must not darken the result");
+        let with_depth = sample(line, 5, None, true);
+        for (flat, depth) in single
+            .into_iter()
+            .flatten()
+            .zip(with_depth.into_iter().flatten())
+        {
+            assert!(
+                flat.abs_diff(depth) <= 1,
+                "The trail over blank canvas should keep its color"
+            );
+        }
     }
 }

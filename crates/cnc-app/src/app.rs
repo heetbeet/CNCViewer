@@ -47,7 +47,7 @@ struct Settings {
     machine_open: bool,
     show_grid: bool,
     show_toolbit_path: bool,
-    opaque_toolbit_path: bool,
+    depth_support: bool,
     show_points: bool,
     five_axis: bool,
     diameter_mode: bool,
@@ -75,7 +75,7 @@ impl Default for Settings {
             machine_open: true,
             show_grid: true,
             show_toolbit_path: false,
-            opaque_toolbit_path: false,
+            depth_support: false,
             show_points: false,
             five_axis: true,
             diameter_mode: false,
@@ -1299,10 +1299,8 @@ impl App {
             crate::render::Draw {
                 rapid: self.settings.show_rapid,
                 grid: self.settings.show_grid,
-                trail: crate::trail::Mode::from_options(
-                    self.settings.show_toolbit_path,
-                    self.settings.opaque_toolbit_path,
-                ),
+                trail: self.settings.show_toolbit_path,
+                depth_support: self.settings.depth_support,
                 points: self.settings.show_points,
                 segments: visible,
                 live: crate::render::LiveDraw { motion, tool },
@@ -1585,20 +1583,33 @@ mod tests {
             .collect();
         arrows.sort_by(|a, b| a.y.total_cmp(&b.y));
         assert_eq!(arrows.len(), 4);
-        let occlude = controls
+        let depth_label = controls
             .iter()
             .find_map(|shape| match &shape.shape {
-                egui::Shape::Text(t) if t.galley.job.text == "Occlude" => {
+                egui::Shape::Text(t) if t.galley.job.text == "Depth support" => {
                     Some(t.pos + t.galley.size() / 2.)
                 }
                 _ => None,
             })
-            .expect("Occlude checkbox must be visible");
-        assert!((arrows[0].y..arrows[1].y).contains(&occlude.y));
-        click(&mut app, occlude.x, occlude.y);
-        assert!(app.settings.opaque_toolbit_path);
-        click(&mut app, occlude.x, occlude.y);
-        assert!(!app.settings.opaque_toolbit_path);
+            .expect("Depth support label must be visible");
+        let depth_toggle = controls
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(r)
+                    if r.rect.size() == Vec2::new(29., 12.)
+                        && r.fill == Color32::from_gray(140)
+                        && (r.rect.center().y - depth_label.y).abs() < 4. =>
+                {
+                    Some(r.rect.center())
+                }
+                _ => None,
+            })
+            .expect("Depth support pill must be visible");
+        assert!(depth_toggle.y < arrows[0].y);
+        click(&mut app, depth_toggle.x, depth_toggle.y);
+        assert!(app.settings.depth_support);
+        click(&mut app, depth_toggle.x, depth_toggle.y);
+        assert!(!app.settings.depth_support);
         click(&mut app, arrows[0].x, arrows[0].y);
         assert_eq!(app.settings.diameter, 8.1);
         click(&mut app, arrows[1].x, arrows[1].y);
