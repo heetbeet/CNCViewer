@@ -1,4 +1,4 @@
-use crate::camera::Camera;
+use crate::{camera::Camera, trail::Mode as TrailMode};
 use cnc_core::engine::Model;
 use cnc_core::geometry::Point;
 use eframe::wgpu::{self, util::DeviceExt};
@@ -39,7 +39,7 @@ struct LiveVertices {
 pub struct Draw {
     pub rapid: bool,
     pub grid: bool,
-    pub trail: bool,
+    pub trail: TrailMode,
     pub points: bool,
     pub segments: usize,
     pub live: LiveDraw,
@@ -508,7 +508,7 @@ impl Plot {
         let Draw {
             rapid: show_rapid,
             grid: show_grid,
-            trail: show_trail,
+            trail,
             points: show_points,
             segments,
             live,
@@ -632,8 +632,10 @@ impl Plot {
                 pass.set_vertex_buffer(0, self.live.slice(tool_start..));
                 pass.draw(0..6, 0..1);
             }
-            if show_trail {
-                self.trail.draw(&mut pass, segments);
+            match trail {
+                TrailMode::Hidden => {}
+                TrailMode::Transparent => self.trail.draw(&mut pass, segments),
+                TrailMode::Opaque => self.trail.draw_opaque(&mut pass, segments),
             }
         }
         self.queue.submit([encoder.finish()]);
@@ -742,7 +744,7 @@ mod tests {
                 Draw {
                     rapid: false,
                     grid: true,
-                    trail: false,
+                    trail: TrailMode::Hidden,
                     points: false,
                     segments: 0,
                     live: Default::default(),
@@ -796,7 +798,7 @@ mod tests {
                 Draw {
                     rapid: false,
                     grid: false,
-                    trail: false,
+                    trail: TrailMode::Hidden,
                     points: false,
                     segments: model.segments.len(),
                     live: Default::default(),
@@ -869,7 +871,7 @@ mod tests {
         let mut draw = Draw {
             rapid: true,
             grid: false,
-            trail: false,
+            trail: TrailMode::Hidden,
             points: false,
             segments: model.segments.len(),
             live: Default::default(),
@@ -923,18 +925,27 @@ mod tests {
         draw.live = Default::default();
         draw.segments = model.segments.len();
         let exposed = render(&mut plot, "bottom", draw);
-        draw.trail = true;
+        draw.trail = TrailMode::Transparent;
         let tinted = render(&mut plot, "top", draw);
         assert!(
             u16::from(tinted[1]) > u16::from(exposed[1]) + 8,
             "Front trail should tint the cut: {tinted:?}"
         );
         assert_eq!(render(&mut plot, "bottom", draw), exposed);
+        draw.trail = TrailMode::Opaque;
+        let solid = render(&mut plot, "top", draw);
+        assert_eq!(solid, [71, 161, 132]);
+        assert_eq!(render(&mut plot, "bottom", draw), exposed);
+        let upper_cut = model.segments.len() - 1;
+        plot.partial_trail(Some((&model.segments[upper_cut], upper_cut, 0.75)));
+        draw.segments = upper_cut;
+        assert_eq!(render(&mut plot, "top", draw), solid);
+        assert_eq!(render(&mut plot, "bottom", draw), exposed);
 
         model = program("G0 X20 Y0 Z5\nG1 X40 F100\nG0 Y20\nX20\nM30\n");
         plot.load(&model).unwrap();
         draw.rapid = true;
-        draw.trail = false;
+        draw.trail = TrailMode::Hidden;
         draw.points = false;
         draw.segments = model.segments.len();
         assert_eq!(render(&mut plot, "front", draw), bottom);
@@ -977,7 +988,7 @@ mod tests {
                 Draw {
                     rapid: false,
                     grid: false,
-                    trail: true,
+                    trail: TrailMode::Transparent,
                     points: false,
                     segments: sample.map_or(model.segments.len(), |(index, _)| index),
                     live: Default::default(),

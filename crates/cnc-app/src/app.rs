@@ -47,6 +47,7 @@ struct Settings {
     machine_open: bool,
     show_grid: bool,
     show_toolbit_path: bool,
+    opaque_toolbit_path: bool,
     show_points: bool,
     five_axis: bool,
     diameter_mode: bool,
@@ -74,6 +75,7 @@ impl Default for Settings {
             machine_open: true,
             show_grid: true,
             show_toolbit_path: false,
+            opaque_toolbit_path: false,
             show_points: false,
             five_axis: true,
             diameter_mode: false,
@@ -1297,7 +1299,10 @@ impl App {
             crate::render::Draw {
                 rapid: self.settings.show_rapid,
                 grid: self.settings.show_grid,
-                trail: self.settings.show_toolbit_path,
+                trail: crate::trail::Mode::from_options(
+                    self.settings.show_toolbit_path,
+                    self.settings.opaque_toolbit_path,
+                ),
                 points: self.settings.show_points,
                 segments: visible,
                 live: crate::render::LiveDraw { motion, tool },
@@ -1565,13 +1570,42 @@ mod tests {
         assert_eq!(app.settings.variables_width, 199.5);
         click(&mut app, 1187., 773.);
         assert_eq!(app.popup, 2, "Backplot popup must open");
-        click(&mut app, 1146., 555.);
+        let controls = frame(&mut app, vec![]);
+        let mut arrows: Vec<_> = controls
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(r)
+                    if r.rect.size() == Vec2::new(14., 10.)
+                        && r.fill == Color32::from_gray(215) =>
+                {
+                    Some(r.rect.center())
+                }
+                _ => None,
+            })
+            .collect();
+        arrows.sort_by(|a, b| a.y.total_cmp(&b.y));
+        assert_eq!(arrows.len(), 4);
+        let occlude = controls
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(t) if t.galley.job.text == "Occlude" => {
+                    Some(t.pos + t.galley.size() / 2.)
+                }
+                _ => None,
+            })
+            .expect("Occlude checkbox must be visible");
+        assert!((arrows[0].y..arrows[1].y).contains(&occlude.y));
+        click(&mut app, occlude.x, occlude.y);
+        assert!(app.settings.opaque_toolbit_path);
+        click(&mut app, occlude.x, occlude.y);
+        assert!(!app.settings.opaque_toolbit_path);
+        click(&mut app, arrows[0].x, arrows[0].y);
         assert_eq!(app.settings.diameter, 8.1);
-        click(&mut app, 1146., 566.);
+        click(&mut app, arrows[1].x, arrows[1].y);
         assert_eq!(app.settings.diameter, 8.);
-        click(&mut app, 1146., 580.);
+        click(&mut app, arrows[2].x, arrows[2].y);
         assert_eq!(app.settings.speed, 9.);
-        click(&mut app, 1146., 590.);
+        click(&mut app, arrows[3].x, arrows[3].y);
         assert_eq!(app.settings.speed, 8.);
         click(&mut app, 1187., 773.);
         assert_eq!(app.popup, 0);

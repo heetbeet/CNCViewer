@@ -3,6 +3,23 @@ use cnc_core::engine::{Model, Segment};
 use cnc_core::geometry::{interpolate, Point};
 use eframe::wgpu::{self, util::DeviceExt};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Hidden,
+    Transparent,
+    Opaque,
+}
+
+impl Mode {
+    pub fn from_options(visible: bool, opaque: bool) -> Self {
+        match (visible, opaque) {
+            (false, _) => Self::Hidden,
+            (true, false) => Self::Transparent,
+            (true, true) => Self::Opaque,
+        }
+    }
+}
+
 pub struct PreparedTrail {
     vertices: Option<wgpu::Buffer>,
     ranges: Vec<(usize, u32, u32)>,
@@ -12,8 +29,10 @@ pub struct PreparedTrail {
 pub struct Trail {
     paint: wgpu::RenderPipeline,
     finish: wgpu::RenderPipeline,
+    opaque: wgpu::RenderPipeline,
     paint_bind: wgpu::BindGroup,
     finish_bind: wgpu::BindGroup,
+    opaque_bind: wgpu::BindGroup,
     vertices: wgpu::Buffer,
     ranges: Vec<(usize, u32, u32)>,
     diameter: f64,
@@ -37,29 +56,40 @@ impl Trail {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &attributes,
         })];
-        let pipeline = |finish: bool| {
+        enum Pass {
+            Paint,
+            Finish,
+            Opaque,
+        }
+        let pipeline = |kind| {
+            let finish = matches!(kind, Pass::Finish);
+            let opaque = matches!(kind, Pass::Opaque);
             let mut ds = depth();
             if !finish {
                 // The translucent brush can tint geometry behind it. Equal-depth centerlines stay crisp.
                 ds.depth_compare = Some(wgpu::CompareFunction::Less);
             }
-            let face = wgpu::StencilFaceState {
-                compare: wgpu::CompareFunction::Equal,
-                fail_op: wgpu::StencilOperation::Keep,
-                depth_fail_op: wgpu::StencilOperation::Keep,
-                pass_op: wgpu::StencilOperation::IncrementClamp,
-            };
-            ds.stencil = wgpu::StencilState {
-                front: face,
-                back: face,
-                read_mask: if finish { 1 } else { 0xfd },
-                write_mask: 0xff,
-            };
+            if opaque {
+                ds.depth_write_enabled = Some(true);
+            } else {
+                let face = wgpu::StencilFaceState {
+                    compare: wgpu::CompareFunction::Equal,
+                    fail_op: wgpu::StencilOperation::Keep,
+                    depth_fail_op: wgpu::StencilOperation::Keep,
+                    pass_op: wgpu::StencilOperation::IncrementClamp,
+                };
+                ds.stencil = wgpu::StencilState {
+                    front: face,
+                    back: face,
+                    read_mask: if finish { 1 } else { 0xfd },
+                    write_mask: 0xff,
+                };
+            }
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(if finish {
-                    "Complete brush stroke"
-                } else {
-                    "Paint brush stroke"
+                label: Some(match kind {
+                    Pass::Paint => "Paint brush stroke",
+                    Pass::Finish => "Complete brush stroke",
+                    Pass::Opaque => "Opaque cutter sweep",
                 }),
                 layout: None,
                 vertex: wgpu::VertexState {
@@ -70,11 +100,15 @@ impl Trail {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: shader,
-                    entry_point: Some("fs_trail"),
+                    entry_point: Some(if opaque {
+                        "fs_opaque_trail"
+                    } else {
+                        "fs_trail"
+                    }),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba8Unorm,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        blend: (!opaque).then_some(wgpu::BlendState::ALPHA_BLENDING),
                         write_mask: if finish {
                             wgpu::ColorWrites::empty()
                         } else {
@@ -92,8 +126,9 @@ impl Trail {
                 cache: None,
             })
         };
-        let paint = pipeline(false);
-        let finish = pipeline(true);
+        let paint = pipeline(Pass::Paint);
+        let finish = pipeline(Pass::Finish);
+        let opaque = pipeline(Pass::Opaque);
         let bind = |pipeline: &wgpu::RenderPipeline| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
@@ -106,11 +141,14 @@ impl Trail {
         };
         let paint_bind = bind(&paint);
         let finish_bind = bind(&finish);
+        let opaque_bind = bind(&opaque);
         Self {
             paint,
             finish,
+            opaque,
             paint_bind,
             finish_bind,
+            opaque_bind,
             vertices: device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: 16,
@@ -304,6 +342,24 @@ impl Trail {
         if let Some((_, _, _, count)) = partial {
             self.paint(pass, &self.partial_vertices, 0..count);
             self.finish(pass);
+        }
+    }
+
+    pub fn draw_opaque(&self, pass: &mut wgpu::RenderPass<'_>, segments: usize) {
+        let completed = self.ranges.partition_point(|range| range.0 <= segments);
+        let partial = self.partial.filter(|(index, _, _, _)| *index == segments);
+        if completed == 0 && partial.is_none() {
+            return;
+        }
+        pass.set_pipeline(&self.opaque);
+        pass.set_bind_group(0, &self.opaque_bind, &[]);
+        if let Some(completed) = completed.checked_sub(1) {
+            pass.set_vertex_buffer(0, self.vertices.slice(..));
+            pass.draw(0..self.ranges[completed].2, 0..1);
+        }
+        if let Some((_, _, _, count)) = partial {
+            pass.set_vertex_buffer(0, self.partial_vertices.slice(..));
+            pass.draw(0..count, 0..1);
         }
     }
 }

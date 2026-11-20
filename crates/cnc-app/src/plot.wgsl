@@ -34,8 +34,12 @@ fn path_depth(depth: f32, color: vec4<f32>) -> f32 {
     out.color=camera.flags;
     return out;
 }
+const TRAIL_COLOR = vec3(0.2784, 0.6314, 0.5176);
 @fragment fn fs_trail(input:Out)->@location(0) vec4<f32> {
-    return vec4(0.2784,0.6314,0.5176,0.28+input.color.w*0.000001);
+    return vec4(TRAIL_COLOR,0.28+input.color.w*0.000001);
+}
+@fragment fn fs_opaque_trail()->@location(0) vec4<f32> {
+    return vec4(TRAIL_COLOR,1.0);
 }
 
 @vertex fn vs_point(@location(0) p:vec3<f32>,@location(1) color:vec4<f32>,@builtin(vertex_index) n:u32)->Out {

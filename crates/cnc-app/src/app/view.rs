@@ -1468,9 +1468,11 @@ impl App {
         }
         if self.popup > 0 {
             let h = if self.popup == 2 { 213. } else { 205. };
+            let width: f32 = if self.popup == 2 { 330. } else { 285. };
+            let width = width.min((plot.width() - 8.).max(1.));
             let rect = Rect::from_min_size(
-                Pos2::new((options.max.x - 285.).max(plot.min.x + 4.), y - h - 8.),
-                Vec2::new(285., h),
+                Pos2::new((options.max.x - width).max(plot.min.x + 4.), y - h - 8.),
+                Vec2::new(width, h),
             );
             let outside_click = ui.input(|input| {
                 input.pointer.primary_clicked()
@@ -1529,15 +1531,22 @@ impl App {
             pop.add_space(31.);
             pop.spacing_mut().item_spacing.y = 4.;
             if self.popup == 2 {
-                measured_toggle(
-                    &mut pop,
-                    "Show toolbit path",
-                    &mut self.settings.show_toolbit_path,
-                    &mut self.settings.diameter,
-                    0.01..=10000.,
-                    0.1,
-                    "mm",
-                );
+                pop.horizontal(|ui| {
+                    ui.label("Toolbit path");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        pill(ui, &mut self.settings.show_toolbit_path);
+                        ui.checkbox(&mut self.settings.opaque_toolbit_path, "Occlude")
+                            .on_hover_text("Draw the cutter trail as a solid surface");
+                        measurement(
+                            ui,
+                            "Tool diameter",
+                            &mut self.settings.diameter,
+                            0.01..=10000.,
+                            0.1,
+                            "mm",
+                        );
+                    });
+                });
                 measured_toggle(
                     &mut pop,
                     "Feed timing",
@@ -1788,65 +1797,74 @@ fn measured_toggle(
         ui.label(text);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             pill(ui, enabled);
-            ui.allocate_ui_with_layout(
-                Vec2::new(84., 21.),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.scope(|ui| {
-                        let visuals = ui.visuals_mut();
-                        visuals.override_text_color = Some(Color32::from_gray(30));
-                        visuals.widgets.inactive.weak_bg_fill = Color32::from_gray(240);
-                        visuals.widgets.hovered.weak_bg_fill = Color32::WHITE;
-                        visuals.widgets.active.weak_bg_fill = Color32::WHITE;
-                        ui.spacing_mut().item_spacing = Vec2::ZERO;
-                        ui.add_sized(
-                            [46., 21.],
-                            egui::DragValue::new(value)
-                                .range(range.clone())
-                                .speed(step)
-                                .max_decimals(3),
-                        )
-                        .on_hover_text(text);
-                        ui.vertical(|ui| {
-                            for direction in [1., -1.] {
-                                let (rect, r) =
-                                    ui.allocate_exact_size(Vec2::new(14., 10.), Sense::click());
-                                ui.painter().rect_filled(
-                                    rect,
-                                    1.,
-                                    if r.hovered() {
-                                        Color32::WHITE
-                                    } else {
-                                        Color32::from_gray(215)
-                                    },
-                                );
-                                let c = rect.center();
-                                ui.painter().add(egui::Shape::convex_polygon(
-                                    vec![
-                                        c + Vec2::new(-3., direction * 1.5),
-                                        c + Vec2::new(3., direction * 1.5),
-                                        c + Vec2::new(0., direction * -2.),
-                                    ],
-                                    TOOL_INK,
-                                    Stroke::NONE,
-                                ));
-                                if r.clicked() {
-                                    *value = ((*value + f64::from(direction) * step) * 1000.)
-                                        .round()
-                                        / 1000.;
-                                    *value = value.clamp(*range.start(), *range.end());
-                                }
-                            }
-                        });
-                    });
-                    ui.add_sized(
-                        [18., 21.],
-                        egui::Label::new(egui::RichText::new(unit).size(11.)),
-                    );
-                },
-            );
+            measurement(ui, text, value, range, step, unit);
         });
     });
+}
+
+fn measurement(
+    ui: &mut egui::Ui,
+    text: &str,
+    value: &mut f64,
+    range: std::ops::RangeInclusive<f64>,
+    step: f64,
+    unit: &str,
+) {
+    ui.allocate_ui_with_layout(
+        Vec2::new(84., 21.),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.scope(|ui| {
+                let visuals = ui.visuals_mut();
+                visuals.override_text_color = Some(Color32::from_gray(30));
+                visuals.widgets.inactive.weak_bg_fill = Color32::from_gray(240);
+                visuals.widgets.hovered.weak_bg_fill = Color32::WHITE;
+                visuals.widgets.active.weak_bg_fill = Color32::WHITE;
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                ui.add_sized(
+                    [46., 21.],
+                    egui::DragValue::new(value)
+                        .range(range.clone())
+                        .speed(step)
+                        .max_decimals(3),
+                )
+                .on_hover_text(text);
+                ui.vertical(|ui| {
+                    for direction in [1., -1.] {
+                        let (rect, r) = ui.allocate_exact_size(Vec2::new(14., 10.), Sense::click());
+                        ui.painter().rect_filled(
+                            rect,
+                            1.,
+                            if r.hovered() {
+                                Color32::WHITE
+                            } else {
+                                Color32::from_gray(215)
+                            },
+                        );
+                        let c = rect.center();
+                        ui.painter().add(egui::Shape::convex_polygon(
+                            vec![
+                                c + Vec2::new(-3., direction * 1.5),
+                                c + Vec2::new(3., direction * 1.5),
+                                c + Vec2::new(0., direction * -2.),
+                            ],
+                            TOOL_INK,
+                            Stroke::NONE,
+                        ));
+                        if r.clicked() {
+                            *value =
+                                ((*value + f64::from(direction) * step) * 1000.).round() / 1000.;
+                            *value = value.clamp(*range.start(), *range.end());
+                        }
+                    }
+                });
+            });
+            ui.add_sized(
+                [18., 21.],
+                egui::Label::new(egui::RichText::new(unit).size(11.)),
+            );
+        },
+    );
 }
 
 fn page_editor(ctx: &egui::Context, id: egui::Id, text: &str, rows: usize) -> Option<usize> {

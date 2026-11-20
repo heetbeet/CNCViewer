@@ -222,7 +222,7 @@ pub fn capture(
         Draw {
             rapid: view["showRapid"] != false,
             grid: view["showGrid"] != false,
-            trail: show_trail,
+            trail: crate::trail::Mode::from_options(show_trail, view["opaqueTrail"] == true),
             points: view["showPoints"] == true,
             segments: filtered.segments.len(),
             live: Default::default(),
