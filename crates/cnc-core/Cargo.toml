@@ -1,0 +1,9 @@
+[package]
+name = "cnc-core"
+version = "2.0.0"
+edition = "2021"
+
+[dependencies]
+serde_json = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }

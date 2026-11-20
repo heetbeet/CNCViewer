@@ -1,0 +1,25 @@
+[package]
+name = "cnc-viewer"
+version = "2.0.0"
+edition = "2021"
+
+[dependencies]
+cnc-core = { path = "../cnc-core" }
+eframe = { version = "=0.37.0", default-features = false, features = ["wgpu_no_default_features", "default_fonts"] }
+rfd = "0.17"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+png = "0.18"
+sha2 = "0.11"
+regex = "1"
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+
+wgpu = { version = "=30.0.2", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
+
+[target."cfg(windows)".dependencies]
+hidapi = { version = "2.6.7", default-features = false, features = ["windows-native"] }
+
+[build-dependencies]
+embed-resource = "=3.0.12"

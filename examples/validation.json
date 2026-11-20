@@ -1,0 +1,88 @@
+{
+  "post": "MachPro Router example",
+  "cutter": {
+    "diameter": 4,
+    "length": 15
+  },
+  "checks": {
+    "safeZ": 5,
+    "maxFeed": 600,
+    "maxPlunge": 150,
+    "requireSpindle": true,
+    "expectedEnd": [
+      2,
+      2,
+      5
+    ]
+  },
+  "stock": {
+    "bounds": {
+      "min": [
+        0,
+        0,
+        -6
+      ],
+      "max": [
+        20,
+        10,
+        0
+      ]
+    },
+    "cellSize": 0.5,
+    "sections": [
+      {
+        "id": "slot-section",
+        "axis": "x",
+        "at": 10
+      }
+    ],
+    "target": {
+      "z": -3,
+      "tolerance": 0.01,
+      "bounds": {
+        "min": [
+          4,
+          0
+        ],
+        "max": [
+          16,
+          4
+        ]
+      }
+    }
+  },
+  "output": "../output/slot-demo",
+  "artifacts": {
+    "stock": true,
+    "sections": true,
+    "trace": {
+      "step": 8,
+      "radius": 2
+    }
+  },
+  "views": [
+    {
+      "name": "slot-top",
+      "angle": "top",
+      "step": 11,
+      "camera": {
+        "bounds": {
+          "min": [
+            -2,
+            -2,
+            -6
+          ],
+          "max": [
+            22,
+            12,
+            5
+          ]
+        }
+      }
+    },
+    {
+      "name": "slot-iso",
+      "angle": "iso"
+    }
+  ]
+}

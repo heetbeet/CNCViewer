@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/cnc-core", "crates/cnc-app"]
+default-members = ["crates/cnc-core"]
+resolver = "2"
+
+[profile.release]
+lto = "thin"
+strip = true

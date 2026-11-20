@@ -1,0 +1,38 @@
+{
+  "setup": {
+    "tools": {
+      "1": {
+        "diameter": 8,
+        "length": 20
+      }
+    }
+  },
+  "cutter": {
+    "diameter": 8
+  },
+  "checks": {
+    "safeZ": 5,
+    "maxFeed": 600,
+    "maxPlunge": 150,
+    "requireSpindle": true,
+    "expectedEnd": [0, 0, 5]
+  },
+  "output": "../output/macro-machining",
+  "views": [
+    {
+      "name": "top",
+      "angle": "top"
+    },
+    {
+      "name": "iso",
+      "angle": "iso"
+    }
+  ],
+  "artifacts": {
+    "movements": true,
+    "trace": {
+      "step": 40,
+      "radius": 5
+    }
+  }
+}

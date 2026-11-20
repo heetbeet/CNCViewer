@@ -1,0 +1,42 @@
+{
+  "output": "../.cnc/goto-slots",
+  "artifacts": {
+    "movements": true,
+    "footprints": true,
+    "trace": true
+  },
+  "cutter": {
+    "diameter": 8,
+    "length": 12
+  },
+  "checks": {
+    "expectedEnd": [
+      0,
+      0,
+      5
+    ],
+    "allowedBounds": {
+      "min": [
+        -5,
+        -5,
+        -2
+      ],
+      "max": [
+        45,
+        45,
+        6
+      ]
+    },
+    "maxFeed": 600
+  },
+  "views": [
+    {
+      "name": "top",
+      "angle": "top"
+    },
+    {
+      "name": "iso",
+      "angle": "iso"
+    }
+  ]
+}
