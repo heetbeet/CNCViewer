@@ -225,6 +225,7 @@ pub fn capture(
             trail: show_trail,
             points: view["showPoints"] == true,
             segments: filtered.segments.len(),
+            live: Default::default(),
         },
     );
     let default_label = witness

@@ -8,7 +8,7 @@ mod view;
 mod window;
 
 use crate::{
-    camera::Camera,
+    camera::{dot, Camera},
     render::{Plot, PreparedPlot},
 };
 use cnc_core::{
@@ -1222,12 +1222,18 @@ impl App {
                     .zoom((-scroll as f64 * 0.002).exp(), [p.x as f64, p.y as f64]);
             }
         }
+        self.camera.z_up = self.settings.z_up;
         if self.settings.raycast && !blocked && (response.clicked() || response.double_clicked()) {
             if let Some(mouse) = response.interact_pointer_pos() {
                 let p = mouse - rect.center();
                 let mut nearest = None;
                 let mut distance = 12f64;
+                let mut front = f64::NEG_INFINITY;
+                let depth_axis = self.camera.depth_axis();
                 for segment in &self.model.segments {
+                    if segment.rapid && !self.settings.show_rapid {
+                        continue;
+                    }
                     let end = if self.settings.five_axis {
                         cnc_core::geometry::rotate_point(segment.end, segment.rotation)
                     } else {
@@ -1235,8 +1241,13 @@ impl App {
                     };
                     let q = self.camera.project(end);
                     let d = (q[0] - p.x as f64).hypot(q[1] - p.y as f64);
-                    if d < distance {
+                    if d > distance + 1e-6 {
+                        continue;
+                    }
+                    let depth = dot(end, depth_axis);
+                    if d < distance - 1e-6 || (d - distance).abs() <= 1e-6 && depth > front {
                         distance = d;
+                        front = depth;
                         nearest = Some((segment.step, end));
                     }
                 }
@@ -1248,7 +1259,6 @@ impl App {
                 }
             }
         }
-        self.camera.z_up = self.settings.z_up;
         if let Err(error) = self
             .plot
             .set_five_axis(&self.model, self.settings.five_axis)
@@ -1285,6 +1295,24 @@ impl App {
         } else {
             None
         });
+        let rotation = self.tool_rotation();
+        let motion = partial.map(|(segment, fraction)| {
+            let end = cnc_core::geometry::interpolate(segment.start, segment.end, fraction);
+            let endpoints = if self.settings.five_axis {
+                [
+                    cnc_core::geometry::rotate_point(segment.start, segment.start_rotation),
+                    cnc_core::geometry::rotate_point(end, rotation),
+                ]
+            } else {
+                [segment.start, end]
+            };
+            (endpoints, segment.rapid)
+        });
+        let tool = self.position().map(|point| {
+            let length = (self.camera.scale * rect.height() as f64 / 20.).max(2.);
+            let top = [point[0], point[1], point[2] + length];
+            [point, top].map(|end| cnc_core::geometry::rotate_point(end, rotation))
+        });
         let resized = self.plot.render(
             size,
             dpi as f64,
@@ -1295,6 +1323,7 @@ impl App {
                 trail: self.settings.show_toolbit_path,
                 points: self.settings.show_points,
                 segments: visible,
+                live: crate::render::LiveDraw { motion, tool },
             },
         );
         if resized {
@@ -1314,48 +1343,6 @@ impl App {
             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1., 1.)),
             Color32::WHITE,
         );
-        if let Some((segment, fraction)) =
-            partial.filter(|(segment, _)| self.settings.show_rapid || !segment.rapid)
-        {
-            let end = cnc_core::geometry::interpolate(segment.start, segment.end, fraction);
-            let draw_point = |point, angles| {
-                let point = if self.settings.five_axis {
-                    cnc_core::geometry::rotate_point(point, angles)
-                } else {
-                    point
-                };
-                let [x, y] = self.camera.project(point);
-                rect.center() + Vec2::new(x as f32, y as f32)
-            };
-            let color = if segment.rapid {
-                Color32::from_rgb(244, 153, 63)
-            } else {
-                Color32::from_rgb(0, 0, 255)
-            };
-            let points = [
-                draw_point(segment.start, segment.start_rotation),
-                draw_point(end, self.tool_rotation()),
-            ];
-            ui.painter()
-                .with_clip_rect(rect)
-                .line_segment(points, egui::Stroke::new(1., color));
-        }
-        if let Some(point) = self.position() {
-            let length = (self.camera.scale * rect.height() as f64 / 20.).max(2.);
-            let top = [point[0], point[1], point[2] + length];
-            let angles = self.tool_rotation();
-            let a = self
-                .camera
-                .project(cnc_core::geometry::rotate_point(point, angles));
-            let b = self
-                .camera
-                .project(cnc_core::geometry::rotate_point(top, angles));
-            let a = rect.center() + Vec2::new(a[0] as f32, a[1] as f32);
-            let b = rect.center() + Vec2::new(b[0] as f32, b[1] as f32);
-            let painter = ui.painter().with_clip_rect(rect);
-            painter.line_segment([a, b], egui::Stroke::new(3.6, Color32::from_gray(65)));
-            painter.circle_filled(b, 1.8, Color32::from_gray(90));
-        }
     }
 }
 fn read_document(
@@ -2215,7 +2202,7 @@ mod tests {
                 (egui::pos2(1260., 380.), -0.04),
                 (egui::pos2(1260., 370.), -0.12),
             ] {
-                frame(
+                let shapes = frame(
                     &mut app,
                     vec![
                         egui::Event::PointerMoved(position),
@@ -2225,6 +2212,11 @@ mod tests {
                 assert_eq!(app.camera.yaw, heading);
                 assert!((app.camera.pitch - pitch).abs() < 1e-12);
                 assert!((app.camera.orbit_direction()[2] - pitch.sin()).abs() < 1e-12);
+                assert_eq!(
+                    shapes.iter().any(|shape| matches!(&shape.shape,
+                        egui::Shape::Text(text) if text.galley.job.text == "Underside")),
+                    pitch < 0.,
+                );
             }
             frame(&mut app, vec![press(egui::pos2(1260., 370.), false)]);
         }

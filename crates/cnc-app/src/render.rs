@@ -1,13 +1,40 @@
 use crate::camera::Camera;
 use cnc_core::engine::Model;
+use cnc_core::geometry::Point;
 use eframe::wgpu::{self, util::DeviceExt};
 use std::{io::BufWriter, path::Path};
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct Vertex {
     pub(crate) point: [f32; 3],
     pub(crate) color: u32,
 }
+impl Vertex {
+    fn path(point: Point, rapid: bool) -> Self {
+        Self {
+            point: point.map(|coordinate| coordinate as f32),
+            color: u32::from_le_bytes(if rapid {
+                [251, 140, 0, 166]
+            } else {
+                [0, 0, 255, 255]
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LiveDraw {
+    pub motion: Option<([Point; 2], bool)>,
+    pub tool: Option<[Point; 2]>,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LiveVertices {
+    motion: [Vertex; 2],
+    tool: [[f32; 3]; 2],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Draw {
     pub rapid: bool,
@@ -15,6 +42,7 @@ pub struct Draw {
     pub trail: bool,
     pub points: bool,
     pub segments: usize,
+    pub live: LiveDraw,
 }
 pub struct PreparedPlot {
     vertices: Option<wgpu::Buffer>,
@@ -22,6 +50,7 @@ pub struct PreparedPlot {
     grid: wgpu::Buffer,
     grid_count: u32,
     origin: [f64; 3],
+    depth_extent: f64,
     five_axis: bool,
     trail: Option<crate::trail::PreparedTrail>,
     pub trail_error: Option<String>,
@@ -34,8 +63,10 @@ pub struct Plot {
     pub view: wgpu::TextureView,
     size: [u32; 2],
     pipeline: wgpu::RenderPipeline,
+    grid_pipeline: wgpu::RenderPipeline,
     uniform: wgpu::Buffer,
     bind: wgpu::BindGroup,
+    grid_bind: wgpu::BindGroup,
     vertices: wgpu::Buffer,
     count: u32,
     grid: wgpu::Buffer,
@@ -43,11 +74,15 @@ pub struct Plot {
     depth: wgpu::TextureView,
     trail: crate::trail::Trail,
     msaa: wgpu::TextureView,
-    last_frame: Option<([f32; 12], Draw)>,
+    last_frame: Option<([f32; 16], Draw)>,
     points: wgpu::RenderPipeline,
     points_bind: wgpu::BindGroup,
+    tool: wgpu::RenderPipeline,
+    tool_bind: wgpu::BindGroup,
+    live: wgpu::Buffer,
     five_axis: bool,
     origin: [f64; 3],
+    depth_extent: f64,
 }
 impl Plot {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
@@ -55,34 +90,91 @@ impl Plot {
             label: Some("CNC path shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("plot.wgsl").into()),
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("CNC paths"),
+        let lines = |label, depth_stencil| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: None,
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: 16,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0=>Float32x3,1=>Unorm8x4],
+                    })],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    ..Default::default()
+                },
+                depth_stencil: Some(depth_stencil),
+                multisample: wgpu::MultisampleState {
+                    count: 4,
+                    ..Default::default()
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let mut path_depth = crate::trail::depth();
+        path_depth.depth_compare = Some(wgpu::CompareFunction::LessEqual);
+        path_depth.depth_write_enabled = Some(true);
+        let pipeline = lines("CNC paths", path_depth.clone());
+        let grid_pipeline = lines("CNC reference grid", crate::trail::depth());
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("CNC camera"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_uniform = |pipeline: &wgpu::RenderPipeline| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                }],
+            })
+        };
+        let bind = bind_uniform(&pipeline);
+        let grid_bind = bind_uniform(&grid_pipeline);
+        let tool = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Live tool marker"),
             layout: None,
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs"),
+                entry_point: Some("vs_tool"),
                 compilation_options: Default::default(),
                 buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: 16,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0=>Float32x3,1=>Unorm8x4],
+                    array_stride: 24,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3],
                 })],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs"),
+                entry_point: Some("fs_tool"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
-                ..Default::default()
-            },
-            depth_stencil: Some(crate::trail::depth()),
+            primitive: Default::default(),
+            depth_stencil: Some(path_depth.clone()),
             multisample: wgpu::MultisampleState {
                 count: 4,
                 ..Default::default()
@@ -90,19 +182,12 @@ impl Plot {
             multiview_mask: None,
             cache: None,
         });
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("CNC camera"),
-            size: 48,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        let tool_bind = bind_uniform(&tool);
+        let live = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Live tool and partial movement"),
+            size: std::mem::size_of::<LiveVertices>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform.as_entire_binding(),
-            }],
         });
         let points = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Toolpath points"),
@@ -139,7 +224,7 @@ impl Plot {
                 })],
             }),
             primitive: Default::default(),
-            depth_stencil: Some(crate::trail::depth()),
+            depth_stencil: Some(path_depth),
             multisample: wgpu::MultisampleState {
                 count: 4,
                 ..Default::default()
@@ -147,14 +232,7 @@ impl Plot {
             multiview_mask: None,
             cache: None,
         });
-        let points_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &points.get_bind_group_layout(0),
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform.as_entire_binding(),
-            }],
-        });
+        let points_bind = bind_uniform(&points);
         let trail = crate::trail::Trail::new(&device, &shader, &uniform);
         let vertices = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Empty path"),
@@ -173,16 +251,22 @@ impl Plot {
             last_frame: None,
             points,
             points_bind,
+            tool,
+            tool_bind,
+            live,
             five_axis: true,
             origin: [0.; 3],
+            depth_extent: 1.,
             device,
             queue,
             texture,
             view,
             size: [1, 1],
             pipeline,
+            grid_pipeline,
             uniform,
             bind,
+            grid_bind,
             grid: vertices.clone(),
             grid_count: 0,
             vertices,
@@ -192,7 +276,7 @@ impl Plot {
     fn depth(device: &wgpu::Device, size: [u32; 2]) -> wgpu::TextureView {
         device
             .create_texture(&wgpu::TextureDescriptor {
-                label: Some("Brush stencil"),
+                label: Some("Path depth and brush stencil"),
                 size: wgpu::Extent3d {
                     width: size[0],
                     height: size[1],
@@ -350,15 +434,11 @@ impl Plot {
         });
 
         let mut vertices = Vec::with_capacity(model.segments.len() * 2);
+        let mut depth_extent = 1_f64;
         for (index, segment) in model.segments.iter().enumerate() {
             if index % 256 == 0 && cancelled() {
                 return Err("Plot cancelled".into());
             }
-            let color = u32::from_le_bytes(if segment.rapid {
-                [251, 140, 0, 166]
-            } else {
-                [0, 0, 255, 255]
-            });
             for (p, angles) in [
                 (segment.start, segment.start_rotation),
                 (segment.end, segment.rotation),
@@ -368,10 +448,12 @@ impl Plot {
                 } else {
                     p
                 };
-                vertices.push(Vertex {
-                    point: std::array::from_fn(|i| (p[i] - origin[i]) as f32),
-                    color,
-                })
+                let relative: [f64; 3] = std::array::from_fn(|i| p[i] - origin[i]);
+                depth_extent = relative
+                    .into_iter()
+                    .map(f64::abs)
+                    .fold(depth_extent, f64::max);
+                vertices.push(Vertex::path(relative, segment.rapid));
             }
         }
         if cancelled() {
@@ -400,6 +482,7 @@ impl Plot {
             grid,
             grid_count,
             origin,
+            depth_extent,
             five_axis,
             trail,
             trail_error,
@@ -413,6 +496,7 @@ impl Plot {
         self.grid = geometry.grid;
         self.grid_count = geometry.grid_count;
         self.origin = geometry.origin;
+        self.depth_extent = geometry.depth_extent;
         self.five_axis = geometry.five_axis;
         self.last_frame = None;
         self.trail.invalidate();
@@ -427,6 +511,7 @@ impl Plot {
             trail: show_trail,
             points: show_points,
             segments,
+            live,
         } = draw;
         let size = size.map(|n| n.clamp(1, 8192));
         let changed = size != self.size;
@@ -439,7 +524,27 @@ impl Plot {
         }
         let mut relative = camera.clone();
         relative.center = std::array::from_fn(|i| camera.center[i] - self.origin[i]);
-        let uniform = relative.uniform(size[0] as f64 / dpi, size[1] as f64 / dpi, show_rapid);
+        let relative_point = |point: Point| std::array::from_fn(|i| point[i] - self.origin[i]);
+        let mut extent = self.depth_extent;
+        let mut live_vertices = LiveVertices::default();
+        let mut to_relative = |point| {
+            let point: Point = relative_point(point);
+            extent = point.into_iter().map(f64::abs).fold(extent, f64::max);
+            point
+        };
+        if let Some((points, rapid)) = live.motion {
+            live_vertices.motion = points.map(|point| Vertex::path(to_relative(point), rapid));
+        }
+        if let Some(points) = live.tool {
+            live_vertices.tool =
+                points.map(|point| to_relative(point).map(|coordinate| coordinate as f32));
+        }
+        let uniform = relative.uniform(
+            size[0] as f64 / dpi,
+            size[1] as f64 / dpi,
+            extent,
+            show_rapid,
+        );
         let signature = (uniform, draw);
         if !changed && self.last_frame == Some(signature) {
             return false;
@@ -447,6 +552,10 @@ impl Plot {
         self.last_frame = Some(signature);
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::cast_slice(&uniform));
+        if live.motion.is_some() || live.tool.is_some() {
+            self.queue
+                .write_buffer(&self.live, 0, bytemuck::bytes_of(&live_vertices));
+        }
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -467,7 +576,10 @@ impl Plot {
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth,
-                    depth_ops: None,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.),
+                        store: wgpu::StoreOp::Discard,
+                    }),
                     stencil_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(0),
                         store: wgpu::StoreOp::Discard,
@@ -477,20 +589,18 @@ impl Plot {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            let axes = self.grid_count.min(6);
+            if self.count != 0 && show_grid {
+                pass.set_pipeline(&self.grid_pipeline);
+                pass.set_bind_group(0, &self.grid_bind, &[]);
+                pass.set_vertex_buffer(0, self.grid.slice(..));
+                pass.draw(axes..self.grid_count, 0..1);
+            }
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind, &[]);
             if self.count != 0 {
                 pass.set_vertex_buffer(0, self.grid.slice(..));
-                let axes = self.grid_count.min(6);
-                if show_grid {
-                    pass.draw(axes..self.grid_count, 0..1);
-                }
                 pass.draw(0..axes, 0..1);
-            }
-            if show_trail {
-                self.trail.draw(&mut pass, segments);
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.bind, &[]);
             }
             pass.set_vertex_buffer(0, self.vertices.slice(..));
             pass.draw(
@@ -499,9 +609,15 @@ impl Plot {
                     .min(segments.saturating_mul(2).min(u32::MAX as usize) as u32),
                 0..1,
             );
+            let tool_start = std::mem::offset_of!(LiveVertices, tool) as u64;
+            if live.motion.is_some() {
+                pass.set_vertex_buffer(0, self.live.slice(..tool_start));
+                pass.draw(0..2, 0..1);
+            }
             if show_points {
                 pass.set_pipeline(&self.points);
                 pass.set_bind_group(0, &self.points_bind, &[]);
+                pass.set_vertex_buffer(0, self.vertices.slice(..));
                 pass.draw(
                     0..6,
                     0..self
@@ -509,6 +625,15 @@ impl Plot {
                         .min(segments.saturating_mul(2).min(u32::MAX as usize) as u32)
                         / 2,
                 );
+            }
+            if live.tool.is_some() {
+                pass.set_pipeline(&self.tool);
+                pass.set_bind_group(0, &self.tool_bind, &[]);
+                pass.set_vertex_buffer(0, self.live.slice(tool_start..));
+                pass.draw(0..6, 0..1);
+            }
+            if show_trail {
+                self.trail.draw(&mut pass, segments);
             }
         }
         self.queue.submit([encoder.finish()]);
@@ -620,6 +745,7 @@ mod tests {
                     trail: false,
                     points: false,
                     segments: 0,
+                    live: Default::default(),
                 },
             );
             let path = std::env::temp_dir().join(format!(
@@ -673,6 +799,7 @@ mod tests {
                     trail: false,
                     points: false,
                     segments: model.segments.len(),
+                    live: Default::default(),
                 },
             );
             let path = std::env::temp_dir().join(format!(
@@ -698,6 +825,130 @@ mod tests {
             "GPU coordinates must be rebased before conversion to f32"
         );
     }
+
+    #[test]
+    fn rendered_occlusion_follows_the_camera_and_not_the_segment_order() {
+        let mut plot = headless().unwrap();
+        let program = |text| {
+            let model = cnc_core::engine::inspect(
+                text,
+                "underside.nc",
+                &Default::default(),
+                &Default::default(),
+            )
+            .unwrap();
+            assert_eq!(model.status, "complete");
+            model
+        };
+        let mut model = program("G0 X20 Y10\nG1 X30 F100\nX40\nG0 Z10\nX30\nX20\nM30\n");
+        plot.load(&model).unwrap();
+        let render = |plot: &mut Plot, view, draw| {
+            let mut camera = Camera::default();
+            camera.view(view);
+            camera.center = [30., 10., 5.];
+            camera.scale = 0.15;
+            plot.render([64, 64], 1., &camera, draw);
+            let path =
+                std::env::temp_dir().join(format!("cnc-depth-{}-{view}.png", std::process::id()));
+            plot.png(&path).unwrap();
+            let mut reader = png::Decoder::new(std::io::BufReader::new(File::open(&path).unwrap()))
+                .read_info()
+                .unwrap();
+            let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+            reader.next_frame(&mut pixels).unwrap();
+            drop(reader);
+            std::fs::remove_file(path).unwrap();
+            (29..35)
+                .map(|y| {
+                    let i = (y * 64 + 32) * 4;
+                    [pixels[i], pixels[i + 1], pixels[i + 2]]
+                })
+                .min_by_key(|color| color[0])
+                .unwrap()
+        };
+        let mut draw = Draw {
+            rapid: true,
+            grid: false,
+            trail: false,
+            points: false,
+            segments: model.segments.len(),
+            live: Default::default(),
+        };
+        let top = render(&mut plot, "top", draw);
+        let bottom = render(&mut plot, "bottom", draw);
+        assert!(
+            top[0] > bottom[0] && top[2] < bottom[2],
+            "top: {top:?}, bottom: {bottom:?}"
+        );
+        model.segments.reverse();
+        plot.load(&model).unwrap();
+        assert_eq!(render(&mut plot, "top", draw), top);
+        assert_eq!(render(&mut plot, "bottom", draw), bottom);
+        draw.points = true;
+        let top_point = render(&mut plot, "top", draw);
+        let bottom_point = render(&mut plot, "bottom", draw);
+        assert!(top_point[0] > bottom_point[0] && top_point[2] < bottom_point[2]);
+        draw.points = false;
+
+        draw.rapid = false;
+        assert_eq!(render(&mut plot, "top", draw), bottom);
+        draw.live.tool = Some([[30., 10., 2.], [30., 10., 8.]]);
+        let tool_above = render(&mut plot, "top", draw);
+        let tool_below = render(&mut plot, "bottom", draw);
+        assert_eq!(
+            tool_above[0], tool_above[2],
+            "Tool in front: {tool_above:?}"
+        );
+        assert!(
+            u16::from(tool_below[2]) > u16::from(tool_below[0]) + 40,
+            "Cut in front: {tool_below:?}"
+        );
+
+        model.segments.retain(|segment| !segment.rapid);
+        plot.load(&model).unwrap();
+        draw.rapid = true;
+        draw.segments = model.segments.len();
+        draw.live = LiveDraw {
+            motion: Some(([[20., 10., -5.], [40., 10., -5.]], true)),
+            tool: None,
+        };
+        assert_eq!(render(&mut plot, "top", draw), bottom);
+        assert_eq!(render(&mut plot, "bottom", draw), top);
+
+        model = program("G0 X20 Y10\nG1 X30 F100\nX40\nG0 Y12 Z10\nG1 X20\nM30\n");
+        plot.load(&model).unwrap();
+        plot.trail(&model, 8.).unwrap();
+        draw.rapid = false;
+        draw.points = true;
+        draw.live = Default::default();
+        draw.segments = model.segments.len();
+        let exposed = render(&mut plot, "bottom", draw);
+        draw.trail = true;
+        let tinted = render(&mut plot, "top", draw);
+        assert!(
+            u16::from(tinted[1]) > u16::from(exposed[1]) + 8,
+            "Front trail should tint the cut: {tinted:?}"
+        );
+        assert_eq!(render(&mut plot, "bottom", draw), exposed);
+
+        model = program("G0 X20 Y0 Z5\nG1 X40 F100\nG0 Y20\nX20\nM30\n");
+        plot.load(&model).unwrap();
+        draw.rapid = true;
+        draw.trail = false;
+        draw.points = false;
+        draw.segments = model.segments.len();
+        assert_eq!(render(&mut plot, "front", draw), bottom);
+        assert_eq!(render(&mut plot, "back", draw), top);
+
+        model = program("G0 X20 Y10\nG1 X40 F100\nG0 X20\nM30\n");
+        plot.load(&model).unwrap();
+        draw.segments = model.segments.len();
+        assert_eq!(render(&mut plot, "top", draw), bottom);
+        model.segments.reverse();
+        plot.load(&model).unwrap();
+        assert_eq!(render(&mut plot, "top", draw), bottom);
+    }
+
     #[test]
     fn continuous_brush_is_uniform_and_separate_coats_cap_at_two() {
         let mut plot = headless().expect("Native graphics adapter");
@@ -729,6 +980,7 @@ mod tests {
                     trail: true,
                     points: false,
                     segments: sample.map_or(model.segments.len(), |(index, _)| index),
+                    live: Default::default(),
                 },
             );
             let path =

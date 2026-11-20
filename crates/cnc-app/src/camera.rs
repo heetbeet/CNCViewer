@@ -28,10 +28,13 @@ impl Camera {
     }
     pub fn basis(&self) -> ([f64; 3], [f64; 3]) {
         let (r, u) = self.orbit_basis();
+        (self.world_axis(r), self.world_axis(u))
+    }
+    fn world_axis(&self, axis: [f64; 3]) -> [f64; 3] {
         if self.z_up {
-            (r, u)
+            axis
         } else {
-            ([r[0], -r[2], r[1]], [u[0], -u[2], u[1]])
+            [axis[0], -axis[2], axis[1]]
         }
     }
     pub fn view(&mut self, name: &str) {
@@ -59,6 +62,9 @@ impl Camera {
         let (s, c) = self.yaw.sin_cos();
         let (p, q) = self.pitch.sin_cos();
         [q * c, q * s, p]
+    }
+    pub fn depth_axis(&self) -> [f64; 3] {
+        self.world_axis(self.orbit_direction())
     }
     pub fn project(&self, point: [f64; 3]) -> [f64; 2] {
         let (r, u) = self.basis();
@@ -105,8 +111,10 @@ impl Camera {
         let (right, up) = self.basis();
         self.scale = (projected(right).max(1.) / width).max(projected(up).max(1.) / height) * 1.15;
     }
-    pub fn uniform(&self, width: f64, height: f64, show_rapid: bool) -> [f32; 12] {
+    pub fn uniform(&self, width: f64, height: f64, extent: f64, show_rapid: bool) -> [f32; 16] {
         let (r, u) = self.basis();
+        // Depth is relative to the vertex buffer's origin, so panning cannot clip the path.
+        let depth = self.depth_axis().map(|v| (-0.25 * v / extent) as f32);
         let sx = 2. / (width * self.scale);
         let sy = 2. / (height * self.scale);
         [
@@ -118,6 +126,10 @@ impl Camera {
             (u[1] * sy) as f32,
             (u[2] * sy) as f32,
             (-dot(self.center, u) * sy) as f32,
+            depth[0],
+            depth[1],
+            depth[2],
+            0.5,
             if show_rapid { 1. } else { 0. },
             (2. / width) as f32,
             (2. / height) as f32,

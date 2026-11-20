@@ -39,6 +39,10 @@ impl Trail {
         })];
         let pipeline = |finish: bool| {
             let mut ds = depth();
+            if !finish {
+                // The translucent brush can tint geometry behind it. Equal-depth centerlines stay crisp.
+                ds.depth_compare = Some(wgpu::CompareFunction::Less);
+            }
             let face = wgpu::StencilFaceState {
                 compare: wgpu::CompareFunction::Equal,
                 fail_op: wgpu::StencilOperation::Keep,

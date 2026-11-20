@@ -1578,6 +1578,15 @@ impl App {
             }
             hovered.map(|index| faces[index].normal)
         };
+        if self.camera.orbit_direction()[2] < -1e-8 {
+            ui.painter().text(
+                center + Vec2::new(0., 37.),
+                Align2::CENTER_TOP,
+                "Underside",
+                FontId::proportional(10.),
+                Color32::from_gray(80),
+            );
+        }
         if let Some(direction) = hit {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             if response.clicked() {
