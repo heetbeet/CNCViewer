@@ -99,7 +99,7 @@ impl Pane {
 
     fn add(&mut self, project: Project, published: Option<OpenTab>) {
         if !self.tabs.is_empty() {
-            self.tabs[self.active].parked = Some(self.viewer.take_project());
+            self.park_active();
         }
         self.active = self.tabs.len();
         self.tabs.push(Slot {
@@ -115,11 +115,20 @@ impl Pane {
             return;
         }
         if let Some(project) = self.tabs[index].parked.take() {
-            self.tabs[self.active].parked = Some(self.viewer.take_project());
+            self.park_active();
             self.active = index;
             self.viewer.install_project(project);
             self.reveal = true;
         }
+    }
+
+    fn park_active(&mut self) {
+        // Keep the previous plot for quick A/B comparison without retaining a
+        // full interpreted model for every open tab.
+        for project in self.tabs.iter_mut().filter_map(|slot| slot.parked.as_mut()) {
+            project.cached_plot = None;
+        }
+        self.tabs[self.active].parked = Some(self.viewer.take_project());
     }
 
     fn remove(&mut self, index: usize) -> (Project, Option<OpenTab>) {
@@ -801,6 +810,7 @@ impl Window {
                     self.publish();
                     self.document_action(index, action);
                     self.publish();
+                    ctx.request_repaint();
                 }
             }
             if command_close {
@@ -844,6 +854,7 @@ impl Window {
                         DropOn::None => {}
                     }
                     self.publish();
+                    ctx.request_repaint();
                 } else if left {
                     ctx.request_repaint_after(Duration::from_millis(16));
                 } else if destination == DropOn::OtherPane {
@@ -1063,6 +1074,28 @@ mod tests {
             let id = window.new_id();
             window.insert(0, Project::new(id, name, "G0 X1\nM30\n"));
         }
+        let finish_plot = |viewer: &mut App| {
+            for _ in 0..200 {
+                viewer.receive();
+                if !viewer.busy {
+                    assert_eq!(viewer.model.status, "complete");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("Plot did not finish");
+        };
+        let pane = &mut window.panes[0];
+        assert!(pane.viewer.busy && pane.viewer.edit_deadline.is_none());
+        finish_plot(&mut pane.viewer);
+        pane.viewer.seek(0);
+        let cached = pane.viewer.model.clone();
+        pane.select(0);
+        assert!(pane.viewer.busy && pane.viewer.edit_deadline.is_none());
+        finish_plot(&mut pane.viewer);
+        pane.select(1);
+        assert!(!pane.viewer.busy && Arc::ptr_eq(&cached, &pane.viewer.model));
+        assert_eq!(pane.viewer.step, 0);
         window.panes[0].viewer.settings.show_toolbit_path = true;
         window.panes[0].viewer.camera.yaw = 0.75;
         let clipboard = std::cell::RefCell::new(Vec::new());

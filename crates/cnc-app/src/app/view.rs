@@ -965,9 +965,13 @@ impl App {
                 .results
                 .as_ref()
                 .is_some_and(|results| results.current().is_some());
-        let playback_rows =
-            (self.running && text.len() > 131_072 && !editor_input && !reveal_match).then(|| {
-                self.playback_rows
+        let editor_focused = e.memory(|memory| memory.has_focus(id));
+        let source_rows = (text.len() > 131_072
+            && (self.running || !editor_focused)
+            && !editor_input
+            && !reveal_match)
+            .then(|| {
+                self.source_rows
                     .entry(selected.clone())
                     .or_insert_with(|| SourceRows::new(text))
             });
@@ -1010,7 +1014,7 @@ impl App {
         let mut changed = false;
         scroll.show_viewport(&mut e, |ui, viewport| {
             let origin = ui.cursor().min;
-            let lines = playback_rows.as_ref().map_or_else(
+            let lines = source_rows.as_ref().map_or_else(
                 || text.bytes().filter(|&byte| byte == b'\n').count() + 1,
                 |rows| rows.starts.len(),
             );
@@ -1070,7 +1074,7 @@ impl App {
                     },
                 );
             }
-            if let Some(rows) = playback_rows.as_ref() {
+            if let Some(rows) = source_rows.as_ref() {
                 let first = first.min(lines - 1);
                 let width = ui.fonts_mut(|fonts| fonts.glyph_width(&FontId::monospace(size), '0'));
                 let text_origin = origin + Vec2::new(49., 0.);
@@ -1652,7 +1656,7 @@ impl App {
             ui.painter().text(
                 center + Vec2::new(0., 70.),
                 Align2::CENTER_TOP,
-                "Underside",
+                "Underside view",
                 FontId::proportional(10.),
                 Color32::from_gray(80),
             );

@@ -145,6 +145,7 @@ pub struct App {
     forward: bool,
     last_frame: Instant,
     generation: u64,
+    plotted_generation: Option<u64>,
     cancel: Option<Arc<AtomicBool>>,
     sender: mpsc::Sender<Job>,
     receiver: mpsc::Receiver<PlotResult>,
@@ -173,7 +174,7 @@ pub struct App {
     block_elapsed: f64,
     last_stop: Option<usize>,
     highlight_cache: BTreeMap<String, view::Highlight>,
-    playback_rows: BTreeMap<String, view::SourceRows>,
+    source_rows: BTreeMap<String, view::SourceRows>,
 }
 impl App {
     pub fn new(
@@ -289,6 +290,7 @@ impl App {
             forward: true,
             last_frame: Instant::now(),
             generation: 0,
+            plotted_generation: None,
             cancel: None,
             sender,
             receiver,
@@ -317,7 +319,7 @@ impl App {
             block_elapsed: 0.,
             last_stop: None,
             highlight_cache: BTreeMap::new(),
-            playback_rows: BTreeMap::new(),
+            source_rows: BTreeMap::new(),
         }
     }
     fn replot(&mut self) {
@@ -368,7 +370,7 @@ impl App {
     }
     fn edited(&mut self, ctx: &egui::Context) {
         self.edited_at = session::now();
-        self.playback_rows.remove(&self.selected);
+        self.source_rows.remove(&self.selected);
         if self.disk.files.get(&self.selected).is_some_and(|file| {
             self.documents
                 .get(&self.selected)
@@ -842,6 +844,7 @@ impl App {
             self.busy = false;
             match result {
                 Ok((model, prepared)) => {
+                    self.plotted_generation = Some(generation);
                     self.preview_stale = false;
                     self.diagnostics
                         .extend(model.diagnostics.iter().chain(&model.warnings).cloned());
@@ -864,20 +867,7 @@ impl App {
                     }
                     let last = self.model.executions.len().saturating_sub(1);
                     if let Some(resume) = resume {
-                        self.step = resume.step.min(last);
-                        let start = self
-                            .model
-                            .executions
-                            .get(self.step)
-                            .map_or(0., |state| state.elapsed / 1000.);
-                        let end = self
-                            .model
-                            .executions
-                            .get(self.step + 1)
-                            .map_or(start, |state| state.elapsed / 1000.);
-                        self.time = resume.time.clamp(start, end);
-                        self.selected_line = resume.line;
-                        self.scroll_line = Some(resume.line);
+                        self.restore_position(resume);
                     } else if fit {
                         self.seek(last);
                     } else {
@@ -911,6 +901,21 @@ impl App {
                 }
             }
         }
+    }
+    fn restore_position(&mut self, resume: project::PlotPosition) {
+        self.step = resume.step.min(max_step(&self.model));
+        let elapsed = |step: usize| {
+            self.model
+                .executions
+                .get(step)
+                .map(|state| state.elapsed / 1000.)
+        };
+        let start = elapsed(self.step).unwrap_or(0.);
+        self.time = resume
+            .time
+            .clamp(start, elapsed(self.step + 1).unwrap_or(start));
+        self.selected_line = resume.line;
+        self.scroll_line = Some(resume.line);
     }
     fn advance(&mut self) {
         let delta = self.last_frame.elapsed().as_secs_f64();
@@ -1373,16 +1378,10 @@ impl App {
         } else {
             egui::Visuals::light()
         };
+        self.receive();
         self.near_view(ui, Some(tabs));
         self.watch_disk(ui.ctx(), focused, Instant::now());
         self.refresh_after_edit(ui.ctx(), Instant::now(), focused);
-        let generation = self.busy;
-        if focused || self.capture_path.is_some() {
-            self.receive();
-        }
-        if generation && !self.busy {
-            ui.ctx().request_repaint();
-        }
         if active {
             self.update_title(ui.ctx());
         }
@@ -2236,7 +2235,7 @@ mod tests {
                 assert!((app.camera.orbit_direction()[2] - pitch.sin()).abs() < 1e-12);
                 assert_eq!(
                     shapes.iter().any(|shape| matches!(&shape.shape,
-                        egui::Shape::Text(text) if text.galley.job.text == "Underside")),
+                        egui::Shape::Text(text) if text.galley.job.text == "Underside view")),
                     pitch < 0.,
                 );
             }

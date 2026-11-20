@@ -24,6 +24,16 @@ pub(super) struct Project {
     #[serde(rename = "plot_cleared")]
     pub(super) plot_paused: bool,
     find: find::Find,
+    #[serde(skip)]
+    pub(super) cached_plot: Option<CachedPlot>,
+}
+
+#[derive(Clone)]
+pub(super) struct CachedPlot {
+    model: Arc<super::Model>,
+    geometry: super::PreparedPlot,
+    diagnostics: Vec<super::Diagnostic>,
+    status: String,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -54,6 +64,7 @@ impl Project {
             settings: None,
             plot_paused: false,
             find: find::Find::default(),
+            cached_plot: None,
         }
     }
 
@@ -147,6 +158,7 @@ impl App {
             settings: Some(self.settings.clone()),
             plot_paused: self.plot_paused,
             find: self.find.clone(),
+            cached_plot: None,
         }
     }
 
@@ -161,9 +173,15 @@ impl App {
     }
 
     pub(super) fn take_project(&mut self) -> Project {
+        let cached_plot = (self.plotted_generation == Some(self.generation)).then(|| CachedPlot {
+            model: self.model.clone(),
+            geometry: self.plot.prepared(),
+            diagnostics: std::mem::take(&mut self.diagnostics),
+            status: std::mem::take(&mut self.status),
+        });
         self.cancel_plot();
         self.highlight_cache.clear();
-        self.playback_rows.clear();
+        self.source_rows.clear();
         self.find.results = None;
         Project {
             id: std::mem::take(&mut self.project_id),
@@ -180,6 +198,7 @@ impl App {
             settings: Some(self.settings.clone()),
             plot_paused: self.plot_paused,
             find: std::mem::take(&mut self.find),
+            cached_plot,
         }
     }
 
@@ -211,10 +230,21 @@ impl App {
         self.selected_line = 0;
         self.scroll_line = None;
         self.last_stop = None;
-        self.model = Arc::default();
-        let _ = self.plot.load(&self.model);
         self.preview_stale = false;
         self.plot_paused = project.plot_paused;
+        if let Some(cached) = project.cached_plot {
+            self.model = cached.model;
+            self.plot.install(cached.geometry);
+            self.diagnostics = cached.diagnostics;
+            self.status = cached.status;
+            self.plotted_generation = Some(self.generation);
+            if let Some(resume) = self.resume_plot.take() {
+                self.restore_position(resume);
+            }
+            return;
+        }
+        self.model = Arc::default();
+        self.plot.clear();
         if self.plot_paused {
             self.status = "Plot paused. Press Ctrl+Enter to plot.".into();
             self.diagnostics.clear();

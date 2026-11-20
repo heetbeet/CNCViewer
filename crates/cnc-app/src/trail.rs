@@ -2,10 +2,12 @@ use crate::render::Vertex;
 use cnc_core::engine::{Model, Segment};
 use cnc_core::geometry::{interpolate, Point};
 use eframe::wgpu::{self, util::DeviceExt};
+use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct PreparedTrail {
     vertices: Option<wgpu::Buffer>,
-    ranges: Vec<(usize, u32, u32)>,
+    ranges: Arc<[(usize, u32, u32)]>,
     diameter: f64,
 }
 
@@ -19,7 +21,7 @@ pub struct Trail {
     depth_bind: wgpu::BindGroup,
     surface_bind: wgpu::BindGroup,
     vertices: wgpu::Buffer,
-    ranges: Vec<(usize, u32, u32)>,
+    ranges: Arc<[(usize, u32, u32)]>,
     diameter: f64,
     partial_vertices: wgpu::Buffer,
     partial: Option<(usize, f64, u32, u32)>,
@@ -95,7 +97,11 @@ impl Trail {
                 layout: None,
                 vertex: wgpu::VertexState {
                     module: shader,
-                    entry_point: Some(if finish { "vs_quad" } else { "vs" }),
+                    entry_point: Some(match kind {
+                        Pass::Finish => "vs_quad",
+                        Pass::Paint => "vs",
+                        Pass::Depth | Pass::Surface => "vs_sweep",
+                    }),
                     compilation_options: Default::default(),
                     buffers: if finish { &[] } else { &buffers },
                 },
@@ -109,7 +115,15 @@ impl Trail {
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba8Unorm,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        blend: Some(if matches!(kind, Pass::Surface) {
+                            // Preserve sweep coverage for the screen-space outline.
+                            wgpu::BlendState {
+                                color: wgpu::BlendState::ALPHA_BLENDING.color,
+                                alpha: wgpu::BlendComponent::REPLACE,
+                            }
+                        } else {
+                            wgpu::BlendState::ALPHA_BLENDING
+                        }),
                         write_mask: if finish || matches!(kind, Pass::Depth) {
                             wgpu::ColorWrites::empty()
                         } else {
@@ -160,7 +174,7 @@ impl Trail {
                 usage: wgpu::BufferUsages::VERTEX,
                 mapped_at_creation: false,
             }),
-            ranges: Vec::new(),
+            ranges: Arc::default(),
             diameter: 0.,
             partial: None,
             partial_vertices: device.create_buffer(&wgpu::BufferDescriptor {
@@ -177,6 +191,14 @@ impl Trail {
     pub fn invalidate(&mut self) {
         self.diameter = 0.;
         self.partial = None;
+        self.ranges = Arc::default();
+    }
+    pub fn prepared(&self) -> Option<PreparedTrail> {
+        (self.diameter > 0.).then(|| PreparedTrail {
+            vertices: (!self.ranges.is_empty()).then(|| self.vertices.clone()),
+            ranges: self.ranges.clone(),
+            diameter: self.diameter,
+        })
     }
     pub fn load(
         &mut self,
@@ -258,7 +280,7 @@ impl Trail {
         });
         Ok(PreparedTrail {
             vertices,
-            ranges,
+            ranges: ranges.into(),
             diameter,
         })
     }

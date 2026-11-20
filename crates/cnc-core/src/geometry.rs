@@ -49,6 +49,9 @@ pub fn interpolate(a: Point, b: Point, t: f64) -> Point {
     std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
 }
 pub fn rotate_point(point: Point, angles: Point) -> Point {
+    if angles == [0.; 3] {
+        return point;
+    }
     let [ax, ay, az] = [
         -angles[0] * PI / 180.,
         -angles[1] * PI / 180.,

@@ -111,10 +111,25 @@ impl Camera {
         let (right, up) = self.basis();
         self.scale = (projected(right).max(1.) / width).max(projected(up).max(1.) / height) * 1.15;
     }
-    pub fn uniform(&self, width: f64, height: f64, extent: f64, show_rapid: bool) -> [f32; 16] {
+    pub fn uniform(
+        &self,
+        width: f64,
+        height: f64,
+        extent: f64,
+        show_rapid: bool,
+        dpi: f64,
+    ) -> [f32; 20] {
         let (r, u) = self.basis();
         // Depth is relative to the vertex buffer's origin, so panning cannot clip the path.
-        let depth = self.depth_axis().map(|v| (-0.25 * v / extent) as f32);
+        let axis = self.depth_axis();
+        let depth = axis.map(|v| (-0.25 * v / extent) as f32);
+        let xy_visible = axis[2].abs() > 0.05;
+        // Depth change per screen point while staying on a horizontal cutting plane.
+        let depth_gradient = if xy_visible {
+            0.25 * self.scale / (extent * axis[2])
+        } else {
+            0.
+        };
         let sx = 2. / (width * self.scale);
         let sy = 2. / (height * self.scale);
         [
@@ -134,6 +149,10 @@ impl Camera {
             (2. / width) as f32,
             (2. / height) as f32,
             0.,
+            (r[2] * depth_gradient) as f32,
+            (u[2] * depth_gradient) as f32,
+            (1. / dpi) as f32,
+            if xy_visible { 1. } else { 0. },
         ]
     }
 }

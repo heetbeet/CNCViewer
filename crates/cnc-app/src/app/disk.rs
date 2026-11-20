@@ -181,7 +181,7 @@ impl Watcher {
 
 impl App {
     pub(super) fn reset_disk_choices(&mut self) {
-        self.playback_rows.clear();
+        self.source_rows.clear();
         self.conflict_choice = None;
         self.overwrite = None;
         self.last_f5 = None;
@@ -254,7 +254,7 @@ impl App {
             file.saved = version;
         }
         self.highlight_cache.remove(name);
-        self.playback_rows.remove(name);
+        self.source_rows.remove(name);
         ctx.data_mut(|data| {
             data.remove::<egui::text_edit::TextEditState>(self.editor_id_for(name));
         });
