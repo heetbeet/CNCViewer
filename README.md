@@ -2,7 +2,7 @@
 
 # CNC Viewer
 
-The 3D backplot, syntax highlighting, icon style, colours, and general layout are inspired by [NC Viewer](https://ncviewer.com/) from [Toolpath Labs, Inc.](https://toolpath.com/). I built this Windows desktop app in Rust for my [MachPro](https://www.mach-labs.com/product/machpro/) router and to give AI agents a way to verify the G-code they write.
+[NC Viewer](https://ncviewer.com/) from [Toolpath Labs, Inc.](https://toolpath.com/) is the inspiration for the 3D backplot, syntax highlighting, icon style, colours, and general layout. I built this Windows desktop app in Rust for my [MachPro](https://www.mach-labs.com/product/machpro/) router and to give AI agents a way to verify the G-code they write.
 
 ## Features
 

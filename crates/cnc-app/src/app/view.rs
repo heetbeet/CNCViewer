@@ -1,3 +1,4 @@
+mod credits;
 mod cube;
 mod diagnostics;
 mod find;
@@ -54,6 +55,7 @@ pub(super) fn fonts(ctx: &egui::Context) {
     }
     ctx.set_fonts(fonts);
     icon_texture(ctx);
+    credits::load_marks(ctx);
     ctx.style_mut_of(egui::Theme::Light, |s| {
         s.spacing.item_spacing = Vec2::new(6., 4.);
         s.text_styles
@@ -484,6 +486,7 @@ impl App {
             ));
             tabs.history_menu(&response);
         }
+        credits::show(ui, band, x + 218.);
     }
     fn sidebar(&mut self, ui: &mut egui::Ui, rect: Rect, tabbed: bool) {
         ui.painter().rect_filled(rect, 0., Color32::WHITE);

@@ -1049,6 +1049,7 @@ mod tests {
         window.panes[0].viewer.settings.show_toolbit_path = true;
         window.panes[0].viewer.camera.yaw = 0.75;
         let clipboard = std::cell::RefCell::new(Vec::new());
+        let opened_urls = std::cell::RefCell::new(Vec::new());
         let frame = |window: &mut Window, events| {
             let mut output = ctx.run_ui(
                 egui::RawInput {
@@ -1060,8 +1061,10 @@ mod tests {
             );
             let shapes = std::mem::take(&mut output.shapes);
             for command in std::mem::take(&mut output.platform_output.commands) {
-                if let egui::OutputCommand::CopyText(text) = command {
-                    clipboard.borrow_mut().push(text);
+                match command {
+                    egui::OutputCommand::CopyText(text) => clipboard.borrow_mut().push(text),
+                    egui::OutputCommand::OpenUrl(url) => opened_urls.borrow_mut().push(url.url),
+                    _ => {}
                 }
             }
             output.drop_without_applying_deltas();
@@ -1248,5 +1251,37 @@ mod tests {
         copy_tab_path(&mut window);
         assert_eq!(&*clipboard.borrow(), &[path.display().to_string()]);
         fs::remove_file(path).unwrap();
+
+        let toolbar = frame(&mut window, vec![]);
+        let credit_text = toolbar
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Inspired by" => {
+                    Some(text.pos + text.galley.size() / 2.)
+                }
+                _ => None,
+            })
+            .expect("Toolbar credit is visible");
+        click(&mut window, credit_text, PointerButton::Primary);
+        let mut marks: Vec<_> = toolbar
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) => {
+                    let rect = mesh.calc_bounds();
+                    (rect.left() >= 1000. && rect.bottom() < super::super::view::TOOLBAR_HEIGHT)
+                        .then_some(rect.center())
+                }
+                _ => None,
+            })
+            .collect();
+        marks.sort_by(|left, right| left.x.total_cmp(&right.x));
+        assert_eq!(marks.len(), 2);
+        for center in marks {
+            click(&mut window, center, PointerButton::Primary);
+        }
+        assert_eq!(
+            &*opened_urls.borrow(),
+            &["https://ncviewer.com/", "https://toolpath.com/"]
+        );
     }
 }
