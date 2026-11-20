@@ -1,27 +1,34 @@
-use crate::render::Vertex;
+use crate::render::run_ids;
 use cnc_core::engine::{Model, Segment};
 use cnc_core::geometry::{interpolate, Point};
 use eframe::wgpu::{self, util::DeviceExt};
 use std::sync::Arc;
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SweepVertex {
+    point: [f32; 3],
+    owner: u32,
+}
+
+type SweepRange = (usize, u32, u32, u32);
+
 #[derive(Clone)]
 pub struct PreparedTrail {
     vertices: Option<wgpu::Buffer>,
-    ranges: Arc<[(usize, u32, u32)]>,
+    ranges: Arc<[SweepRange]>,
     diameter: f64,
 }
 
 pub struct Trail {
     paint: wgpu::RenderPipeline,
     finish: wgpu::RenderPipeline,
-    depth: wgpu::RenderPipeline,
     surface: wgpu::RenderPipeline,
     paint_bind: wgpu::BindGroup,
     finish_bind: wgpu::BindGroup,
-    depth_bind: wgpu::BindGroup,
     surface_bind: wgpu::BindGroup,
     vertices: wgpu::Buffer,
-    ranges: Arc<[(usize, u32, u32)]>,
+    ranges: Arc<[SweepRange]>,
     diameter: f64,
     partial_vertices: wgpu::Buffer,
     partial: Option<(usize, f64, u32, u32)>,
@@ -37,7 +44,7 @@ pub fn depth() -> wgpu::DepthStencilState {
 }
 impl Trail {
     pub fn new(device: &wgpu::Device, shader: &wgpu::ShaderModule, uniform: &wgpu::Buffer) -> Self {
-        let attributes = wgpu::vertex_attr_array![0=>Float32x3,1=>Unorm8x4];
+        let attributes = wgpu::vertex_attr_array![0=>Float32x3,1=>Uint32];
         let buffers = [Some(wgpu::VertexBufferLayout {
             array_stride: 16,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -46,15 +53,15 @@ impl Trail {
         enum Pass {
             Paint,
             Finish,
-            Depth,
             Surface,
         }
         let pipeline = |kind| {
             let finish = matches!(kind, Pass::Finish);
+            let surface = matches!(kind, Pass::Surface);
             let mut ds = depth();
             use wgpu::{CompareFunction as Compare, StencilOperation as Stencil};
-            // Less preserves the centerlines at equal depth. The surface pass blends
-            // only the nearest sweep, once per sample even at overlapping capsules.
+            // Flat plots count brush coats. Depth-supported plots store the nearest
+            // sweep separately so the resolve can compare it with the wire's run.
             let (depth_compare, compare, pass_op, read_mask, write_mask) = match kind {
                 Pass::Paint => (
                     Compare::Less,
@@ -70,11 +77,10 @@ impl Trail {
                     1,
                     0xff,
                 ),
-                Pass::Depth => (Compare::Less, Compare::Always, Stencil::Replace, 1, 1),
-                Pass::Surface => (Compare::Equal, Compare::Equal, Stencil::Zero, 1, 1),
+                Pass::Surface => (Compare::Less, Compare::Always, Stencil::Keep, 0, 0),
             };
             ds.depth_compare = Some(depth_compare);
-            ds.depth_write_enabled = Some(matches!(kind, Pass::Depth));
+            ds.depth_write_enabled = Some(surface);
             let face = wgpu::StencilFaceState {
                 compare,
                 fail_op: Stencil::Keep,
@@ -91,7 +97,6 @@ impl Trail {
                 label: Some(match kind {
                     Pass::Paint => "Paint brush stroke",
                     Pass::Finish => "Complete brush stroke",
-                    Pass::Depth => "Cutter sweep depth",
                     Pass::Surface => "Depth-supported cutter sweep",
                 }),
                 layout: None,
@@ -99,32 +104,19 @@ impl Trail {
                     module: shader,
                     entry_point: Some(match kind {
                         Pass::Finish => "vs_quad",
-                        Pass::Paint => "vs",
-                        Pass::Depth | Pass::Surface => "vs_sweep",
+                        Pass::Paint | Pass::Surface => "vs_sweep",
                     }),
                     compilation_options: Default::default(),
                     buffers: if finish { &[] } else { &buffers },
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: shader,
-                    entry_point: Some(if matches!(kind, Pass::Surface) {
-                        "fs_depth_trail"
-                    } else {
-                        "fs_trail"
-                    }),
+                    entry_point: Some(if surface { "fs_sweep" } else { "fs_trail" }),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba8Unorm,
-                        blend: Some(if matches!(kind, Pass::Surface) {
-                            // Preserve sweep coverage for the screen-space outline.
-                            wgpu::BlendState {
-                                color: wgpu::BlendState::ALPHA_BLENDING.color,
-                                alpha: wgpu::BlendComponent::REPLACE,
-                            }
-                        } else {
-                            wgpu::BlendState::ALPHA_BLENDING
-                        }),
-                        write_mask: if finish || matches!(kind, Pass::Depth) {
+                        blend: (!surface).then_some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: if finish {
                             wgpu::ColorWrites::empty()
                         } else {
                             wgpu::ColorWrites::ALL
@@ -143,7 +135,6 @@ impl Trail {
         };
         let paint = pipeline(Pass::Paint);
         let finish = pipeline(Pass::Finish);
-        let depth = pipeline(Pass::Depth);
         let surface = pipeline(Pass::Surface);
         let bind = |pipeline: &wgpu::RenderPipeline| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -157,16 +148,13 @@ impl Trail {
         };
         let paint_bind = bind(&paint);
         let finish_bind = bind(&finish);
-        let depth_bind = bind(&depth);
         let surface_bind = bind(&surface);
         Self {
             paint,
             finish,
-            depth,
             surface,
             paint_bind,
             finish_bind,
-            depth_bind,
             surface_bind,
             vertices: device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
@@ -239,7 +227,7 @@ impl Trail {
         let mut previous = None;
         let mut brush_start = 0;
         let mut prior_index = 0;
-        for (index, segment) in model.segments.iter().enumerate() {
+        for (index, (segment, owner)) in model.segments.iter().zip(run_ids(model)).enumerate() {
             if index % 256 == 0
                 && cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
             {
@@ -263,8 +251,15 @@ impl Trail {
             if !connected {
                 brush_start = vertices.len() as u32;
             }
-            capsule(&mut vertices, segment.start, segment.end, radius, origin);
-            ranges.push((index + 1, brush_start, vertices.len() as u32));
+            capsule(
+                &mut vertices,
+                segment.start,
+                segment.end,
+                radius,
+                origin,
+                owner,
+            );
+            ranges.push((index + 1, brush_start, vertices.len() as u32, owner));
             previous = Some((segment.end, segment.tool, d));
             prior_index = index;
         }
@@ -305,12 +300,12 @@ impl Trail {
             }) {
                 return false;
             }
-            let brush = self
+            let range = self
                 .ranges
                 .binary_search_by_key(&(index + 1), |range| range.0)
                 .ok()
-                .map(|position| self.ranges[position].1);
-            if let Some(brush) = brush {
+                .map(|position| self.ranges[position]);
+            if let Some((_, brush, _, owner)) = range {
                 let mut vertices = Vec::with_capacity(150);
                 let end = interpolate(segment.start, segment.end, fraction);
                 capsule(
@@ -319,6 +314,7 @@ impl Trail {
                     end,
                     segment.tool_diameter.unwrap_or(self.diameter) / 2.,
                     origin,
+                    owner,
                 );
                 queue.write_buffer(&self.partial_vertices, 0, bytemuck::cast_slice(&vertices));
                 self.partial = Some((index, fraction, brush, vertices.len() as u32));
@@ -378,38 +374,40 @@ impl Trail {
         if completed == 0 && partial.is_none() {
             return;
         }
-        pass.set_stencil_reference(1);
-        for (pipeline, bind) in [
-            (&self.depth, &self.depth_bind),
-            (&self.surface, &self.surface_bind),
-        ] {
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bind, &[]);
-            if let Some(completed) = completed.checked_sub(1) {
-                pass.set_vertex_buffer(0, self.vertices.slice(..));
-                pass.draw(0..self.ranges[completed].2, 0..1);
-            }
-            if let Some((_, _, _, count)) = partial {
-                pass.set_vertex_buffer(0, self.partial_vertices.slice(..));
-                pass.draw(0..count, 0..1);
-            }
+        pass.set_pipeline(&self.surface);
+        pass.set_bind_group(0, &self.surface_bind, &[]);
+        if let Some(completed) = completed.checked_sub(1) {
+            pass.set_vertex_buffer(0, self.vertices.slice(..));
+            pass.draw(0..self.ranges[completed].2, 0..1);
+        }
+        if let Some((_, _, _, count)) = partial {
+            pass.set_vertex_buffer(0, self.partial_vertices.slice(..));
+            pass.draw(0..count, 0..1);
         }
     }
 }
 
-fn capsule(vertices: &mut Vec<Vertex>, a: Point, b: Point, radius: f64, origin: Point) {
+fn capsule(
+    vertices: &mut Vec<SweepVertex>,
+    a: Point,
+    b: Point,
+    radius: f64,
+    origin: Point,
+    owner: u32,
+) {
     let unit_circle = std::sync::OnceLock::get_or_init(&UNIT_CIRCLE, || {
         std::array::from_fn(|i| {
             let angle = i as f64 * std::f64::consts::TAU / 24.;
             [angle.cos(), angle.sin()]
         })
     });
+    let owner = owner | (u32::from((a[2] - b[2]).abs() < 1e-6) << 24);
     let mut triangle = |a, b, c| {
         for p in [a, b, c] {
             let p: Point = p;
-            vertices.push(Vertex {
+            vertices.push(SweepVertex {
                 point: std::array::from_fn(|i| (p[i] - origin[i]) as f32),
-                color: 0,
+                owner,
             });
         }
     };

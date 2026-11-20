@@ -5,14 +5,18 @@ use eframe::wgpu::{self, util::DeviceExt};
 use std::{io::BufWriter, path::Path};
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-pub(crate) struct Vertex {
-    pub(crate) point: [f32; 3],
-    pub(crate) color: u32,
+struct Vertex {
+    point: [f32; 3],
+    color: u32,
+    owner: u32,
+    direction: [f32; 3],
 }
 impl Vertex {
-    fn path(point: Point, rapid: bool) -> Self {
+    fn path(point: Point, direction: [f32; 3], rapid: bool, owner: u32) -> Self {
         Self {
             point: point.map(|coordinate| coordinate as f32),
+            direction,
+            owner,
             color: u32::from_le_bytes(if rapid {
                 [251, 140, 0, 166]
             } else {
@@ -20,6 +24,25 @@ impl Vertex {
             }),
         }
     }
+}
+
+pub(crate) fn run_ids(model: &Model) -> impl Iterator<Item = u32> + '_ {
+    model
+        .segments
+        .iter()
+        .enumerate()
+        .scan(0, |run, (i, segment)| {
+            if segment.rapid || i == 0 || {
+                let previous = &model.segments[i - 1];
+                previous.rapid
+                    || previous.end != segment.start
+                    || previous.tool != segment.tool
+                    || previous.tool_diameter != segment.tool_diameter
+            } {
+                *run = i as u32 + 1;
+            }
+            Some(*run)
+        })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -53,13 +76,16 @@ pub struct PreparedPlot {
     grid_count: u32,
     origin: [f64; 3],
     depth_extent: f64,
+    runs: std::sync::Arc<[u32]>,
     five_axis: bool,
     trail: Option<crate::trail::PreparedTrail>,
     pub trail_error: Option<String>,
 }
 
-struct HaloFrame {
-    color: wgpu::TextureView,
+struct DepthFrame {
+    size: [u32; 2],
+    sweep: wgpu::TextureView,
+    sweep_depth: wgpu::TextureView,
     bind: wgpu::BindGroup,
 }
 
@@ -80,10 +106,8 @@ pub struct Plot {
     grid_count: u32,
     depth: wgpu::TextureView,
     sampled_depth: wgpu::TextureView,
-    wire_halo: wgpu::RenderPipeline,
-    wire_halo_bind: wgpu::BindGroup,
-    halo: wgpu::RenderPipeline,
-    halo_frame: Option<HaloFrame>,
+    depth_resolve: wgpu::RenderPipeline,
+    depth_frame: Option<DepthFrame>,
     trail: crate::trail::Trail,
     msaa: wgpu::TextureView,
     last_frame: Option<([f32; 20], Draw)>,
@@ -95,6 +119,7 @@ pub struct Plot {
     five_axis: bool,
     origin: [f64; 3],
     depth_extent: f64,
+    runs: std::sync::Arc<[u32]>,
 }
 impl Plot {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
@@ -102,7 +127,7 @@ impl Plot {
             label: Some("CNC path shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("plot.wgsl").into()),
         });
-        let lines = |label, depth_stencil| {
+        let lines = |label, depth_stencil, blend| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: None,
@@ -111,9 +136,9 @@ impl Plot {
                     entry_point: Some("vs"),
                     compilation_options: Default::default(),
                     buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: 16,
+                        array_stride: size_of::<Vertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0=>Float32x3,1=>Unorm8x4],
+                        attributes: &wgpu::vertex_attr_array![0=>Float32x3,1=>Unorm8x4,2=>Uint32,3=>Float32x3],
                     })],
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -122,7 +147,7 @@ impl Plot {
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba8Unorm,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        blend,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -142,8 +167,12 @@ impl Plot {
         let mut path_depth = crate::trail::depth();
         path_depth.depth_compare = Some(wgpu::CompareFunction::LessEqual);
         path_depth.depth_write_enabled = Some(true);
-        let pipeline = lines("CNC paths", path_depth.clone());
-        let grid_pipeline = lines("CNC reference grid", crate::trail::depth());
+        let pipeline = lines("CNC paths", path_depth.clone(), None);
+        let grid_pipeline = lines(
+            "CNC reference grid",
+            crate::trail::depth(),
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+        );
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("CNC camera"),
             size: 80,
@@ -162,41 +191,6 @@ impl Plot {
         };
         let bind = bind_uniform(&pipeline);
         let grid_bind = bind_uniform(&grid_pipeline);
-        let mut halo_depth = crate::trail::depth();
-        halo_depth.depth_compare = Some(wgpu::CompareFunction::Less);
-        let wire_halo = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Wire crossing halos"),
-            layout: None,
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_wire_halo"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: 32,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![0=>Float32x3,1=>Unorm8x4,2=>Float32x3],
-                })],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_wire_halo"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::COLOR,
-                })],
-            }),
-            primitive: Default::default(),
-            depth_stencil: Some(halo_depth),
-            multisample: wgpu::MultisampleState {
-                count: 4,
-                ..Default::default()
-            },
-            multiview_mask: None,
-            cache: None,
-        });
-        let wire_halo_bind = bind_uniform(&wire_halo);
         let tool = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Live tool marker"),
             layout: None,
@@ -244,18 +238,28 @@ impl Plot {
                 entry_point: Some("vs_point"),
                 compilation_options: Default::default(),
                 buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: 32,
+                    array_stride: 2 * size_of::<Vertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &[
                         wgpu::VertexAttribute {
                             format: wgpu::VertexFormat::Float32x3,
-                            offset: 16,
+                            offset: 32,
                             shader_location: 0,
                         },
                         wgpu::VertexAttribute {
                             format: wgpu::VertexFormat::Unorm8x4,
-                            offset: 28,
+                            offset: 44,
                             shader_location: 1,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Uint32,
+                            offset: 48,
+                            shader_location: 2,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 52,
+                            shader_location: 3,
                         },
                     ],
                 })],
@@ -266,7 +270,7 @@ impl Plot {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -283,7 +287,7 @@ impl Plot {
         let trail = crate::trail::Trail::new(&device, &shader, &uniform);
         let vertices = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Empty path"),
-            size: 16,
+            size: size_of::<Vertex>() as u64,
             usage: wgpu::BufferUsages::VERTEX,
             mapped_at_creation: false,
         });
@@ -291,18 +295,18 @@ impl Plot {
         let view = texture.create_view(&Default::default());
         let (depth, sampled_depth) = Self::depth(&device, [1, 1]);
         let msaa = Self::msaa(&device, [1, 1]);
-        let halo = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Depth halos"),
+        let depth_resolve = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Depth-aware plot resolve"),
             layout: None,
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs_halo"),
+                entry_point: Some("vs_resolve"),
                 compilation_options: Default::default(),
                 buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_halo"),
+                entry_point: Some("fs_resolve"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8Unorm,
@@ -319,10 +323,8 @@ impl Plot {
         Self {
             depth,
             sampled_depth,
-            wire_halo,
-            wire_halo_bind,
-            halo,
-            halo_frame: None,
+            depth_resolve,
+            depth_frame: None,
             trail,
             msaa,
             last_frame: None,
@@ -334,6 +336,7 @@ impl Plot {
             five_axis: true,
             origin: [0.; 3],
             depth_extent: 1.,
+            runs: Default::default(),
             device,
             queue,
             texture,
@@ -386,7 +389,8 @@ impl Plot {
                 sample_count: 4,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             })
             .create_view(&Default::default())
@@ -480,13 +484,18 @@ impl Plot {
         ] {
             let mut end = [0.; 3];
             end[axis] = half as f32;
+            let direction = std::array::from_fn(|index| if index == axis { 1. } else { 0. });
             grid.push(Vertex {
                 point: origin.map(|v| -v as f32),
                 color: u32::from_le_bytes(start_color),
+                direction,
+                ..Default::default()
             });
             grid.push(Vertex {
                 point: std::array::from_fn(|i| (end[i] as f64 - origin[i]) as f32),
                 color: u32::from_le_bytes(end_color),
+                direction,
+                ..Default::default()
             });
         }
         for n in -10..=10 {
@@ -504,6 +513,7 @@ impl Plot {
                     grid.push(Vertex {
                         point: std::array::from_fn(|i| (point[i] - origin[i]) as f32),
                         color,
+                        ..Default::default()
                     });
                 }
             }
@@ -516,26 +526,31 @@ impl Plot {
         });
 
         let mut vertices = Vec::with_capacity(model.segments.len() * 2);
+        let runs: std::sync::Arc<[_]> = run_ids(model).collect();
         let mut depth_extent = 1_f64;
-        for (index, segment) in model.segments.iter().enumerate() {
+        for (index, (segment, &owner)) in model.segments.iter().zip(runs.iter()).enumerate() {
             if index % 256 == 0 && cancelled() {
                 return Err("Plot cancelled".into());
             }
-            for (p, angles) in [
+            let endpoints = [
                 (segment.start, segment.start_rotation),
                 (segment.end, segment.rotation),
-            ] {
+            ]
+            .map(|(p, angles)| {
                 let p = if five_axis {
                     cnc_core::geometry::rotate_point(p, angles)
                 } else {
                     p
                 };
-                let relative: [f64; 3] = std::array::from_fn(|i| p[i] - origin[i]);
+                std::array::from_fn::<_, 3, _>(|i| p[i] - origin[i])
+            });
+            let direction = std::array::from_fn(|i| (endpoints[1][i] - endpoints[0][i]) as f32);
+            for relative in endpoints {
                 depth_extent = relative
                     .into_iter()
                     .map(f64::abs)
                     .fold(depth_extent, f64::max);
-                vertices.push(Vertex::path(relative, segment.rapid));
+                vertices.push(Vertex::path(relative, direction, segment.rapid, owner));
             }
         }
         if cancelled() {
@@ -565,6 +580,7 @@ impl Plot {
             grid_count,
             origin,
             depth_extent,
+            runs,
             five_axis,
             trail,
             trail_error,
@@ -579,6 +595,7 @@ impl Plot {
         self.grid_count = geometry.grid_count;
         self.origin = geometry.origin;
         self.depth_extent = geometry.depth_extent;
+        self.runs = geometry.runs;
         self.five_axis = geometry.five_axis;
         self.last_frame = None;
         self.trail.invalidate();
@@ -594,6 +611,7 @@ impl Plot {
             grid_count: self.grid_count,
             origin: self.origin,
             depth_extent: self.depth_extent,
+            runs: self.runs.clone(),
             five_axis: self.five_axis,
             trail: self.trail.prepared(),
             trail_error: None,
@@ -602,6 +620,7 @@ impl Plot {
     pub fn clear(&mut self) {
         self.count = 0;
         self.grid_count = 0;
+        self.runs = Default::default();
         self.last_frame = None;
         self.trail.invalidate();
     }
@@ -619,7 +638,7 @@ impl Plot {
         let changed = size != self.size;
         if changed {
             (self.depth, self.sampled_depth) = Self::depth(&self.device, size);
-            self.halo_frame = None;
+            self.depth_frame = None;
             self.msaa = Self::msaa(&self.device, size);
             self.texture = Self::texture(&self.device, size);
             self.view = self.texture.create_view(&Default::default());
@@ -636,44 +655,80 @@ impl Plot {
             point
         };
         if let Some((points, rapid)) = live.motion {
-            live_vertices.motion = points.map(|point| Vertex::path(to_relative(point), rapid));
+            let direction = std::array::from_fn(|i| (points[1][i] - points[0][i]) as f32);
+            let owner = self.runs.get(segments).copied().unwrap_or(0xff_ff_ff);
+            live_vertices.motion =
+                points.map(|point| Vertex::path(to_relative(point), direction, rapid, owner));
         }
         if let Some(points) = live.tool {
             live_vertices.tool =
                 points.map(|point| to_relative(point).map(|coordinate| coordinate as f32));
         }
-        let uniform = relative.uniform(
+        let depth_support = depth_support && self.count != 0;
+        let sweep = trail && self.trail.diameter() > 0.;
+        let mut uniform = relative.uniform(
             size[0] as f64 / dpi,
             size[1] as f64 / dpi,
             extent,
             show_rapid,
             dpi,
         );
+        uniform[15] = if depth_support {
+            if sweep {
+                2.
+            } else {
+                1.
+            }
+        } else {
+            0.
+        };
         let signature = (uniform, draw);
         if !changed && self.last_frame == Some(signature) {
             return false;
         }
         self.last_frame = Some(signature);
-        let sweep_halo = depth_support && trail && self.trail.diameter() > 0.;
-        if sweep_halo && self.halo_frame.is_none() {
-            let color = Self::texture(&self.device, size).create_view(&Default::default());
+        let sweep_size = if sweep { size } else { [1, 1] };
+        if depth_support
+            && self
+                .depth_frame
+                .as_ref()
+                .is_none_or(|frame| frame.size != sweep_size)
+        {
+            let sweep = Self::msaa(&self.device, sweep_size);
+            let (sweep_depth, sampled_sweep_depth) = Self::depth(&self.device, sweep_size);
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Depth halo inputs"),
-                layout: &self.halo.get_bind_group_layout(0),
+                label: Some("Depth resolve layers"),
+                layout: &self.depth_resolve.get_bind_group_layout(0),
                 entries: &[
                     wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&color),
+                        resource: wgpu::BindingResource::TextureView(&self.msaa),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: wgpu::BindingResource::TextureView(&self.sampled_depth),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&sweep),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&sampled_sweep_depth),
+                    },
                 ],
             });
-            self.halo_frame = Some(HaloFrame { color, bind });
+            self.depth_frame = Some(DepthFrame {
+                size: sweep_size,
+                sweep,
+                sweep_depth,
+                bind,
+            });
         }
-        let halo = self.halo_frame.as_ref().filter(|_| sweep_halo);
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::cast_slice(&uniform));
         if live.motion.is_some() || live.tool.is_some() {
@@ -687,7 +742,7 @@ impl Plot {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.msaa,
                     depth_slice: None,
-                    resolve_target: Some(halo.map_or(&self.view, |frame| &frame.color)),
+                    resolve_target: (!depth_support).then_some(&self.view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.949,
@@ -695,14 +750,18 @@ impl Plot {
                             b: 0.949,
                             a: 1.,
                         }),
-                        store: wgpu::StoreOp::Discard,
+                        store: if depth_support {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.),
-                        store: if sweep_halo {
+                        store: if depth_support {
                             wgpu::StoreOp::Store
                         } else {
                             wgpu::StoreOp::Discard
@@ -752,31 +811,37 @@ impl Plot {
                 pass.set_vertex_buffer(0, self.live.slice(tool_start..));
                 pass.draw(0..6, 0..1);
             }
-            if trail {
-                if depth_support {
-                    self.trail.draw_depth_supported(&mut pass, segments);
-                } else {
-                    self.trail.draw(&mut pass, segments);
-                }
-            }
-            if depth_support && self.count != 0 {
-                pass.set_pipeline(&self.wire_halo);
-                pass.set_bind_group(0, &self.wire_halo_bind, &[]);
-                pass.set_vertex_buffer(0, self.grid.slice(..));
-                pass.draw(0..6, 0..axes / 2);
-                if visible != 0 {
-                    pass.set_vertex_buffer(0, self.vertices.slice(..));
-                    pass.draw(0..6, 0..visible / 2);
-                }
-                if live.motion.is_some() {
-                    pass.set_vertex_buffer(0, self.live.slice(..tool_start));
-                    pass.draw(0..6, 0..1);
-                }
+            if trail && !depth_support {
+                self.trail.draw(&mut pass, segments);
             }
         }
-        if let Some(halo) = halo {
+        if let Some(frame) = self.depth_frame.as_ref().filter(|_| depth_support) {
+            if sweep {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Cutter sweep layer"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &frame.sweep,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &frame.sweep_depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                self.trail.draw_depth_supported(&mut pass, segments);
+            }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Depth halos"),
+                label: Some("Depth-aware plot resolve"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.view,
                     depth_slice: None,
@@ -788,8 +853,8 @@ impl Plot {
                 })],
                 ..Default::default()
             });
-            pass.set_pipeline(&self.halo);
-            pass.set_bind_group(0, &halo.bind, &[]);
+            pass.set_pipeline(&self.depth_resolve);
+            pass.set_bind_group(0, &frame.bind, &[]);
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([encoder.finish()]);
@@ -1238,16 +1303,17 @@ mod tests {
                 let foreground = [(31, 28), (32, 28), (31, 29), (32, 29)];
                 let left_gap = [(30, 31), (30, 32)];
                 let right_gap = [(34, 31), (34, 32)];
-                assert_eq!(
-                    strongest_rapid(&flat, &foreground),
-                    strongest_rapid(&depth, &foreground)
+                assert!(
+                    strongest_rapid(&flat, &foreground)
+                        .abs_diff(strongest_rapid(&depth, &foreground))
+                        <= 1
                 );
                 for gap in [left_gap, right_gap] {
                     let plain = strongest_rapid(&flat, &gap);
                     let with_gap = strongest_rapid(&depth, &gap);
                     assert!(plain < 200, "Expected a rapid at {gap:?}");
                     if lift == 0 {
-                        assert_eq!(plain, with_gap);
+                        assert!(plain.abs_diff(with_gap) <= 1);
                     } else {
                         assert!(
                             with_gap >= 234,
@@ -1314,6 +1380,141 @@ mod tests {
             }
         }
         assert!(compared > 60);
+    }
+
+    fn depth_fixture(
+        source: &str,
+        camera: &Camera,
+        trail: bool,
+        depth_support: bool,
+        name: &str,
+    ) -> Vec<[u8; 4]> {
+        let mut plot = headless().unwrap();
+        let model =
+            cnc_core::engine::inspect(source, name, &Default::default(), &Default::default())
+                .unwrap();
+        assert_eq!(model.status, "complete");
+        plot.load(&model).unwrap();
+        if trail {
+            plot.trail(&model, 4.).unwrap();
+        }
+        plot.render(
+            [96, 96],
+            1.,
+            camera,
+            Draw {
+                rapid: true,
+                grid: false,
+                trail,
+                depth_support,
+                points: false,
+                segments: model.segments.len(),
+                live: Default::default(),
+            },
+        );
+        let path = std::env::temp_dir().join(format!(
+            "cnc-{}-{name}-{depth_support}.png",
+            std::process::id()
+        ));
+        plot.png(&path).unwrap();
+        let mut reader = png::Decoder::new(std::io::BufReader::new(File::open(&path).unwrap()))
+            .read_info()
+            .unwrap();
+        let mut bytes = vec![0; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut bytes).unwrap();
+        drop(reader);
+        std::fs::remove_file(path).unwrap();
+        bytes
+            .chunks_exact(4)
+            .map(|pixel| pixel.try_into().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn dense_cut_stays_blue_under_its_own_sweep() {
+        use std::fmt::Write;
+        let mut source = String::from("G0 X12 Y18 Z0\nG1 X48 F100\n");
+        for i in 1..=21 {
+            let x = if i % 2 == 1 { 12 } else { 48 };
+            writeln!(
+                source,
+                "Y{} Z{}\nX{x}",
+                18. + f64::from(i) * 0.35,
+                f64::from(i) * 0.7
+            )
+            .unwrap();
+        }
+        source.push_str("M30\n");
+        let mut camera = Camera::default();
+        camera.view("top");
+        camera.center = [30., 21.5, 5.];
+        camera.scale = 0.5;
+        let flat = depth_fixture(&source, &camera, false, false, "dense");
+        let depth = depth_fixture(&source, &camera, true, true, "dense");
+        let mut blue_samples = 0;
+        for (plain, supported) in flat.iter().zip(&depth) {
+            if plain[2] > 190 && plain[0] < 160 {
+                assert!(supported[0] <= plain[0] + 2, "{plain:?} -> {supported:?}");
+                blue_samples += 1;
+            }
+        }
+        assert!(blue_samples > 500);
+    }
+
+    #[test]
+    fn orange_crossing_cleans_rear_blue_from_its_antialiasing() {
+        let mut camera = Camera::default();
+        camera.view("top");
+        camera.yaw = -75_f64.to_radians();
+        camera.center = [20.05, 20., 5.];
+        camera.scale = 0.2;
+        let orange_only = depth_fixture(
+            "G0 X20 Y14\nG0 Z10\nG0 Y26\nM30",
+            &camera,
+            false,
+            true,
+            "orange",
+        );
+        let crossing = depth_fixture(
+            "G0 X10 Y20\nG1 X30 F100\nG0 X20 Y14\nG0 Z10\nG0 Y26\nM30",
+            &camera,
+            false,
+            true,
+            "orange-cross",
+        );
+        let mut foreground = 0;
+        for y in 45..51 {
+            for x in 45..51 {
+                let a = orange_only[y * 96 + x];
+                let b = crossing[y * 96 + x];
+                if a[0].saturating_sub(a[2]) > 30 {
+                    assert_eq!(a, b, "foreground pixel ({x}, {y})");
+                    foreground += 1;
+                }
+            }
+        }
+        assert!(foreground >= 4);
+    }
+
+    #[test]
+    fn nearer_sweep_marks_its_edge_on_another_run() {
+        let source = "G0 X20 Y20\nG1 X40 F100\nG0 X30 Y15 Z6\nG1 Y25\nM30";
+        let mut camera = Camera::default();
+        camera.view("top");
+        camera.center = [30., 20., 3.];
+        camera.scale = 0.25;
+        let flat = depth_fixture(source, &camera, true, false, "sweep-edge");
+        let depth = depth_fixture(source, &camera, true, true, "sweep-edge");
+        let edge = 44 * 96 + 39;
+        let rear = 44 * 96 + 35;
+        assert_eq!(flat[edge], flat[rear]);
+        assert!(
+            depth[edge][0] >= depth[rear][0] + 20,
+            "edge {:?}, rear {:?}",
+            depth[edge],
+            depth[rear]
+        );
+        assert!(flat[rear][0].abs_diff(depth[rear][0]) <= 1);
     }
 
     #[test]
