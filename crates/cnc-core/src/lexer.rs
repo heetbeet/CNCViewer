@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::borrow::Cow;
 const KEYWORDS: &[&str] = &[
     "SETVN", "WHILE", "PCLOS", "POPEN", "DPRNT", "GOTO", "THEN", "ROUND", "SQRT", "ASIN", "ACOS",
     "ATAN", "ABS", "FIX", "FUP", "SIN", "COS", "TAN", "EXP", "MOD", "XOR", "AND", "END", "BCD",
@@ -7,14 +8,26 @@ const KEYWORDS: &[&str] = &[
 fn whitespace(c: char) -> bool {
     matches!(c,'\u{9}'..='\u{d}'|' '| '\u{a0}'|'\u{1680}'|'\u{2000}'..='\u{200a}'|'\u{2028}'|'\u{2029}'|'\u{202f}'|'\u{205f}'|'\u{3000}'|'\u{feff}')
 }
-fn error(message: impl Into<String>, column: Option<usize>, limit: bool) -> Value {
+fn diagnostic(message: impl Into<String>, column: Option<usize>, limit: bool) -> Value {
     let mut value = json!({"message":message.into(),"code":if limit{"LIMIT"}else{"PROGRAM"}});
     if let Some(column) = column {
         value["column"] = json!(column)
     }
-    json!({"error":value})
+    value
 }
 pub fn uncomment(text: &str) -> Value {
+    match strip_comments(text) {
+        Ok((code, comments)) => json!({"ok":{"code":code,"comments":comments}}),
+        Err(error) => json!({"error":error}),
+    }
+}
+
+pub(crate) fn strip_comments(text: &str) -> Result<(Cow<'_, str>, Vec<String>), Value> {
+    if text.bytes().all(|byte| {
+        byte.is_ascii() && !byte.is_ascii_lowercase() && !matches!(byte, b'(' | b')' | b';')
+    }) {
+        return Ok((Cow::Borrowed(text), Vec::new()));
+    }
     let mut code = String::new();
     let mut comment = String::new();
     let mut comments = Vec::new();
@@ -31,16 +44,16 @@ pub fn uncomment(text: &str) -> Value {
             }
             ')' => {
                 if depth == 0 {
-                    return error(
+                    return Err(diagnostic(
                         "Unmatched closing comment parenthesis.",
                         Some(column),
                         false,
-                    );
+                    ));
                 }
                 depth -= 1;
                 code.push(' ');
                 if depth == 0 {
-                    comments.push(comment.clone())
+                    comments.push(std::mem::take(&mut comment))
                 }
             }
             _ if depth > 0 => {
@@ -58,18 +71,94 @@ pub fn uncomment(text: &str) -> Value {
         column += c.len_utf16();
     }
     if depth > 0 {
-        return error("Unclosed comment.", None, false);
+        return Err(diagnostic("Unclosed comment.", None, false));
     }
-    json!({"ok":{"code":code.to_uppercase(),"comments":comments}})
+    Ok((Cow::Owned(code.to_uppercase()), comments))
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Number,
+    Named,
+    Keyword,
+    Address,
+    Operator,
+    End,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Token<'a> {
+    pub kind: Kind,
+    pub text: &'a str,
+    pub number: f64,
+    pub column: usize,
+}
+
+impl<'a> Token<'a> {
+    fn symbol_token(kind: Kind, text: &'a str, column: usize) -> Self {
+        Self {
+            kind,
+            text,
+            number: 0.,
+            column,
+        }
+    }
+    pub fn symbol(&self) -> &'a str {
+        if self.kind == Kind::Number {
+            ""
+        } else {
+            self.text
+        }
+    }
+    pub fn value(&self) -> Value {
+        if self.kind == Kind::Number {
+            Value::from(self.number)
+        } else {
+            Value::from(self.text)
+        }
+    }
+}
+
 pub fn lex(code: &str) -> Value {
-    let mut tokens = Vec::<Value>::new();
+    let tokens = match tokenize(code) {
+        Ok(tokens) => tokens,
+        Err(error) => return json!({"error":error}),
+    };
+    let tokens = tokens
+        .into_iter()
+        .map(|token| {
+            let kind = match token.kind {
+                Kind::Number => "number",
+                Kind::Named => "named",
+                Kind::Keyword => "keyword",
+                Kind::Address => "address",
+                Kind::Operator => "operator",
+                Kind::End => "end",
+            };
+            let mut value = json!({"kind":kind,"value":token.value(),"column":token.column});
+            if token.kind == Kind::Number {
+                value["raw"] = Value::from(token.text);
+            }
+            value
+        })
+        .collect();
+    Value::Object(serde_json::Map::from_iter([(
+        "ok".into(),
+        Value::Array(tokens),
+    )]))
+}
+
+pub(crate) fn tokenize(code: &str) -> Result<Vec<Token<'_>>, Value> {
+    let mut tokens = Vec::new();
     let mut offset = 0;
     let mut column = 0;
     let mut depth = 0;
     while offset < code.len() {
         if tokens.len() > 4096 {
-            return error("A block exceeds the token limit.", Some(column), true);
+            return Err(diagnostic(
+                "A block exceeds the token limit.",
+                Some(column),
+                true,
+            ));
         }
         let rest = &code[offset..];
         let c = rest.chars().next().unwrap();
@@ -94,13 +183,18 @@ pub fn lex(code: &str) -> Value {
             let raw = &rest[..count];
             let value = raw.parse::<f64>().unwrap_or(f64::INFINITY);
             if !value.is_finite() {
-                return error(
+                return Err(diagnostic(
                     "Numeric value is outside the supported range.",
                     Some(column),
                     false,
-                );
+                ));
             }
-            tokens.push(json!({"kind":"number","value":value,"raw":raw,"column":column}));
+            tokens.push(Token {
+                kind: Kind::Number,
+                text: raw,
+                number: value,
+                column,
+            });
             offset += count;
             column += count;
             continue;
@@ -118,7 +212,7 @@ pub fn lex(code: &str) -> Value {
             {
                 count += 1
             }
-            tokens.push(json!({"kind":"named","value":&rest[1..count],"column":column}));
+            tokens.push(Token::symbol_token(Kind::Named, &rest[1..count], column));
             offset += count;
             column += count;
             continue;
@@ -156,20 +250,20 @@ pub fn lex(code: &str) -> Value {
                 count += c.len_utf8()
             }
             if rest[count..].starts_with('[') {
-                tokens.push(json!({"kind":"keyword","value":name,"column":column}));
+                tokens.push(Token::symbol_token(Kind::Keyword, name, column));
                 column += rest[..count].encode_utf16().count();
                 offset += count;
                 continue;
             }
         }
         if let Some(word) = KEYWORDS.iter().find(|word| rest.starts_with(**word)) {
-            tokens.push(json!({"kind":"keyword","value":word,"column":column}));
+            tokens.push(Token::symbol_token(Kind::Keyword, word, column));
             offset += word.len();
             column += word.len();
             continue;
         }
         if c.is_ascii_uppercase() {
-            tokens.push(json!({"kind":"address","value":c.to_string(),"column":column}));
+            tokens.push(Token::symbol_token(Kind::Address, &rest[..1], column));
             offset += 1;
             column += 1;
             continue;
@@ -177,9 +271,9 @@ pub fn lex(code: &str) -> Value {
         let operator = ["**", "<>", "<=", ">=", "=="]
             .into_iter()
             .find(|op| rest.starts_with(op));
-        let operator = operator.map(str::to_owned).or_else(|| {
+        let operator = operator.or_else(|| {
             if "+*/-=<>#[],%:".contains(c) {
-                Some(c.to_string())
+                Some(&rest[..1])
             } else {
                 None
             }
@@ -188,34 +282,43 @@ pub fn lex(code: &str) -> Value {
             if op == "[" {
                 depth += 1;
                 if depth > 10 {
-                    return error(
+                    return Err(diagnostic(
                         "MachPro expressions allow at most ten bracket levels.",
                         Some(column),
                         false,
-                    );
+                    ));
                 }
             }
             if op == "]" {
                 depth -= 1;
                 if depth < 0 {
-                    return error("Unmatched closing expression bracket.", Some(column), false);
+                    return Err(diagnostic(
+                        "Unmatched closing expression bracket.",
+                        Some(column),
+                        false,
+                    ));
                 }
             }
             offset += op.len();
-            tokens.push(json!({"kind":"operator","value":op,"column":column}));
+            tokens.push(Token::symbol_token(Kind::Operator, op, column));
             column += op.len();
             continue;
         }
-        return error(format!("Unexpected character '{c}'."), Some(column), false);
+        return Err(diagnostic(
+            format!("Unexpected character '{c}'."),
+            Some(column),
+            false,
+        ));
     }
     if depth != 0 {
-        return error("Unclosed expression bracket.", Some(column), false);
+        return Err(diagnostic(
+            "Unclosed expression bracket.",
+            Some(column),
+            false,
+        ));
     }
-    tokens.push(json!({"kind":"end","value":"","column":column}));
-    Value::Object(serde_json::Map::from_iter([(
-        "ok".into(),
-        Value::Array(tokens),
-    )]))
+    tokens.push(Token::symbol_token(Kind::End, "", column));
+    Ok(tokens)
 }
 #[cfg(test)]
 mod tests {

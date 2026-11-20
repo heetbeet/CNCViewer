@@ -1,3 +1,4 @@
+use super::lexer::{strip_comments, tokenize, Kind, Token};
 use serde_json::{json, Value};
 type Result<T> = std::result::Result<T, Value>;
 
@@ -28,16 +29,16 @@ fn integer(value: f64, label: &str, min: f64, max: f64) -> Result<f64> {
         ))
     }
 }
-struct Parser {
-    tokens: Vec<Value>,
+struct Parser<'a> {
+    tokens: Vec<Token<'a>>,
     index: usize,
     depth: usize,
 }
-impl Parser {
+impl<'a> Parser<'a> {
     fn bounded<T>(&mut self, action: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         if self.depth >= 128 {
             return Err(
-                json!({"message":"Native syntax nesting exceeds 128 levels.","code":"LIMIT","column":self.tokens[self.index]["column"]}),
+                json!({"message":"Native syntax nesting exceeds 128 levels.","code":"LIMIT","column":self.tokens[self.index].column}),
             );
         }
         self.depth += 1;
@@ -45,14 +46,14 @@ impl Parser {
         self.depth -= 1;
         result
     }
-    fn value(&self) -> &str {
-        self.tokens[self.index]["value"].as_str().unwrap_or("")
+    fn value(&self) -> &'a str {
+        self.tokens[self.index].symbol()
     }
-    fn kind(&self) -> &str {
-        self.tokens[self.index]["kind"].as_str().unwrap_or("")
+    fn kind(&self) -> Kind {
+        self.tokens[self.index].kind
     }
     fn done(&self) -> bool {
-        self.kind() == "end"
+        self.kind() == Kind::End
     }
     fn take(&mut self, value: &str) -> bool {
         if self.value() == value {
@@ -63,12 +64,7 @@ impl Parser {
         }
     }
     fn error(&self, message: impl Into<String>) -> Value {
-        failure(
-            message,
-            self.tokens[self.index]["column"]
-                .as_u64()
-                .map(|v| v as usize),
-        )
+        failure(message, Some(self.tokens[self.index].column))
     }
     fn expect(&mut self, value: &str) -> Result<()> {
         if self.take(value) {
@@ -84,8 +80,8 @@ impl Parser {
             )))
         }
     }
-    fn next(&mut self) -> Value {
-        let value = self.tokens[self.index].clone();
+    fn next(&mut self) -> Token<'a> {
+        let value = self.tokens[self.index];
         self.index = (self.index + 1).min(self.tokens.len() - 1);
         value
     }
@@ -93,8 +89,8 @@ impl Parser {
         self.bounded(|parser| parser.variable_inner())
     }
     fn variable_inner(&mut self) -> Result<Value> {
-        if self.kind() == "named" {
-            return Ok(node("named", [("name", self.next()["value"].clone())]));
+        if self.kind() == Kind::Named {
+            return Ok(node("named", [("name", self.next().value())]));
         }
         self.expect("#")?;
         if self.take("[") {
@@ -102,32 +98,32 @@ impl Parser {
             self.expect("]")?;
             return Ok(node("variable", [("address", address)]));
         }
-        if self.value() == "#" || self.kind() == "named" {
+        if self.value() == "#" || self.kind() == Kind::Named {
             let address = self.variable()?;
             return Ok(node("variable", [("address", address)]));
         }
-        if self.kind() != "number" {
+        if self.kind() != Kind::Number {
             return Err(
                 self.error("Expected a variable number, name or bracketed address after '#'.")
             );
         }
-        let address = node("number", [("value", self.next()["value"].clone())]);
+        let address = node("number", [("value", self.next().value())]);
         Ok(node("variable", [("address", address)]))
     }
     fn expression(&mut self, minimum: u32) -> Result<Value> {
         self.bounded(|parser| parser.expression_inner(minimum))
     }
     fn expression_inner(&mut self, minimum: u32) -> Result<Value> {
-        let left = if self.kind() == "number" {
-            node("number", [("value", self.next()["value"].clone())])
-        } else if self.value() == "#" || self.kind() == "named" {
+        let left = if self.kind() == Kind::Number {
+            node("number", [("value", self.next().value())])
+        } else if self.value() == "#" || self.kind() == Kind::Named {
             self.variable()?
         } else if self.take("[") {
             let value = self.expression(0)?;
             self.expect("]")?;
             value
         } else if ["+", "-", "NOT"].contains(&self.value()) {
-            let operator = self.next()["value"].clone();
+            let operator = self.next().value();
             node(
                 "unary",
                 [("operator", operator), ("operand", self.expression(40)?)],
@@ -138,7 +134,7 @@ impl Parser {
         ]
         .contains(&self.value())
         {
-            let name = self.next()["value"].clone();
+            let name = self.next().value();
             self.expect("[")?;
             let mut args = vec![self.expression(0)?];
             while self.take(",") {
@@ -150,7 +146,7 @@ impl Parser {
                 && self
                     .tokens
                     .get(self.index + 1)
-                    .is_some_and(|t| t["value"] == "[")
+                    .is_some_and(|t| t.symbol() == "[")
             {
                 self.next();
                 self.expect("[")?;
@@ -170,8 +166,8 @@ impl Parser {
         };
         let mut operations = Vec::new();
         while !self.done() {
-            let operator = self.value().to_owned();
-            let precedence = match operator.as_str() {
+            let operator = self.value();
+            let precedence = match operator {
                 "EQ" | "NE" | "LT" | "LE" | "GT" | "GE" | "=" | "==" | "<>" | "<" | "<=" | ">"
                 | ">=" => 10,
                 "+" | "-" | "OR" | "XOR" => 20,
@@ -185,7 +181,7 @@ impl Parser {
             self.next();
             let right = self.expression(precedence + u32::from(operator != "**"))?;
             operations.push(Value::Object(serde_json::Map::from_iter([
-                ("operator".into(), Value::String(operator)),
+                ("operator".into(), Value::from(operator)),
                 ("operand".into(), right),
             ])));
         }
@@ -231,66 +227,50 @@ impl Parser {
                 self.expect("]")?;
                 self.expect("DO")?;
                 let id = self.next();
-                if id["kind"] != "number" {
+                if id.kind != Kind::Number {
                     return Err(self.error("DO requires a loop number."));
                 }
-                let id = integer(
-                    id["value"].as_f64().unwrap(),
-                    "Loop identifier",
-                    1.,
-                    99999999.,
-                )?;
+                let id = integer(id.number, "Loop identifier", 1., 99999999.)?;
                 items.push(node(
                     "while",
                     [("condition", condition), ("id", Value::from(id))],
                 ));
             } else if self.take("END") {
                 let id = self.next();
-                if id["kind"] != "number" {
+                if id.kind != Kind::Number {
                     return Err(self.error("END requires a loop number."));
                 }
-                let id = integer(
-                    id["value"].as_f64().unwrap(),
-                    "Loop identifier",
-                    1.,
-                    99999999.,
-                )?;
+                let id = integer(id.number, "Loop identifier", 1., 99999999.)?;
                 items.push(json!({"type":"end","id":id}));
-            } else if self.value() == "#" || self.kind() == "named" {
+            } else if self.value() == "#" || self.kind() == Kind::Named {
                 let target = self.variable()?;
                 self.expect("=")?;
                 items.push(node(
                     "assign",
                     [("target", target), ("value", self.expression(0)?)],
                 ));
-            } else if self.kind() == "address" || self.value() == ":" {
-                let letter = self.next()["value"].as_str().unwrap().to_owned();
+            } else if self.kind() == Kind::Address || self.value() == ":" {
+                let letter = self.next().symbol();
                 let start = self.index;
-                if self.done() || self.kind() == "address" {
-                    let address = if letter == ":" { "O" } else { &letter };
+                if self.done() || self.kind() == Kind::Address {
+                    let address = if letter == ":" { "O" } else { letter };
                     return Err(self.error(format!("Address {address} is missing a value")));
                 }
                 let value = self.expression(0)?;
                 let literal = &self.tokens[start..self.index];
                 let raw = match literal {
-                    [number] => number["kind"] == "number",
+                    [number] => number.kind == Kind::Number,
                     [sign, number] => {
-                        (sign["value"] == "+" || sign["value"] == "-") && number["kind"] == "number"
+                        matches!(sign.symbol(), "+" | "-") && number.kind == Kind::Number
                     }
                     _ => false,
                 };
                 let decimal = raw
                     && literal
                         .iter()
-                        .any(|t| t["raw"].as_str().is_some_and(|v| v.contains('.')));
+                        .any(|t| t.kind == Kind::Number && t.text.contains('.'));
                 let text = if raw {
-                    json!(literal
-                        .iter()
-                        .map(|t| t["raw"]
-                            .as_str()
-                            .or_else(|| t["value"].as_str())
-                            .unwrap_or(""))
-                        .collect::<String>())
+                    Value::from(literal.iter().map(|t| t.text).collect::<String>())
                 } else {
                     Value::Null
                 };
@@ -299,7 +279,7 @@ impl Parser {
                     [
                         (
                             "letter",
-                            Value::from(if letter == ":" { "O" } else { &letter }),
+                            Value::from(if letter == ":" { "O" } else { letter }),
                         ),
                         ("value", value),
                         ("decimalLiteral", Value::Bool(decimal)),
@@ -320,17 +300,14 @@ pub fn parse_block(text: &str) -> Value {
     }
 }
 pub(crate) fn parse_syntax(text: &str) -> Result<Value> {
-    let uncomment = super::lexer::uncomment(text);
-    if uncomment.get("error").is_some() {
-        return Err(uncomment["error"].clone());
-    }
-    let mut active = uncomment["ok"]["code"].as_str().unwrap().trim().to_owned();
+    let (code, comments) = strip_comments(text)?;
+    let mut active = code.trim();
     let mut deleted = Value::Null;
     if active.starts_with('/') {
         let tail = &active[1..];
         let digit = tail.as_bytes().first().filter(|c| c.is_ascii_digit());
         deleted = json!(digit.map_or(0, |c| (c - b'0') as u32));
-        active = tail[usize::from(digit.is_some())..].trim_start().to_owned();
+        active = tail[usize::from(digit.is_some())..].trim_start();
     }
     let prefix = if let Some(tail) = active.strip_prefix('N') {
         tail.bytes().take_while(u8::is_ascii_digit).count()
@@ -340,7 +317,7 @@ pub(crate) fn parse_syntax(text: &str) -> Result<Value> {
     let special = if prefix > 0 {
         active[prefix + 1..].trim_start()
     } else {
-        &active
+        active
     };
     let mut items = None;
     if let Some(tail) = special.strip_prefix("SETVN") {
@@ -378,18 +355,12 @@ pub(crate) fn parse_syntax(text: &str) -> Result<Value> {
     let special = items.is_some();
     let mut items = match items {
         Some(items) => items,
-        None => {
-            let mut tokens = super::lexer::lex(&active);
-            if tokens.get("error").is_some() {
-                return Err(tokens["error"].clone());
-            }
-            Parser {
-                tokens: std::mem::take(tokens["ok"].as_array_mut().unwrap()),
-                index: 0,
-                depth: 0,
-            }
-            .statements()?
+        None => Parser {
+            tokens: tokenize(active)?,
+            index: 0,
+            depth: 0,
         }
+        .statements()?,
     };
     if special && prefix > 0 {
         items.insert(0,json!({"type":"word","letter":"N","value":{"type":"number","value":active[1..prefix+1].parse::<f64>().unwrap_or(f64::INFINITY)}}));
@@ -423,7 +394,10 @@ pub(crate) fn parse_syntax(text: &str) -> Result<Value> {
         }
     }
     Ok(Value::Object(serde_json::Map::from_iter([
-        ("comments".into(), uncomment["ok"]["comments"].clone()),
+        (
+            "comments".into(),
+            Value::Array(comments.into_iter().map(Value::String).collect()),
+        ),
         ("items".into(), Value::Array(items)),
         ("blockDelete".into(), deleted),
         ("label".into(), label),
