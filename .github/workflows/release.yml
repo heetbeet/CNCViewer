@@ -3,6 +3,12 @@ name: Windows release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,10 +18,12 @@ jobs:
     runs-on: windows-2025
     env:
       RUSTUP_TOOLCHAIN: 1.95.0-x86_64-pc-windows-msvc
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - name: Set up Rust
         run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
@@ -45,4 +53,4 @@ jobs:
       - name: Publish the Windows x64 executable
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$env:GITHUB_REF_NAME" 'output/desktop/CNC-Viewer-windows-x64.exe' --verify-tag --notes-from-tag --title "CNC Viewer $env:GITHUB_REF_NAME" --repo "$env:GITHUB_REPOSITORY"
+        run: gh release create "$env:RELEASE_TAG" 'output/desktop/CNC-Viewer-windows-x64.exe' --verify-tag --notes-from-tag --title "CNC Viewer $env:RELEASE_TAG"
