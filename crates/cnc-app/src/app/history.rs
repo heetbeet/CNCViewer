@@ -147,7 +147,7 @@ mod tests {
             std::process::id(),
             session::now()
         ));
-        let (store, _) = Session::start(root.clone(), false).unwrap();
+        let (store, _, _) = Session::start(root.clone(), false).unwrap();
         let present = root.join("present.nc");
         let missing = root.join("removed-folder").join("missing.nc");
         fs::write(&present, "M30\n").unwrap();

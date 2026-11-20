@@ -45,13 +45,14 @@ pub(super) struct Session {
 }
 
 impl Session {
-    pub fn start(root: PathBuf, restore: bool) -> io::Result<(Self, Vec<OpenTab>)> {
+    pub fn start(root: PathBuf, restore: bool) -> io::Result<(Self, Vec<OpenTab>, bool)> {
         let windows = root.join("windows");
         fs::create_dir_all(&windows)?;
         let mut session = Self { root, lease: None };
         let _lock = session.lock()?;
         let log = session.read()?;
         let mut another_window = false;
+        let mut interrupted = false;
         for entry in fs::read_dir(&windows)? {
             let path = entry?.path();
             if path.extension().and_then(|extension| extension.to_str()) != Some("lock") {
@@ -61,6 +62,7 @@ impl Session {
                 continue;
             };
             if file.try_lock().is_ok() {
+                interrupted = true;
                 drop(file);
                 let _ = fs::remove_file(path);
             } else {
@@ -84,7 +86,7 @@ impl Session {
         } else {
             Vec::new()
         };
-        Ok((session, candidates))
+        Ok((session, candidates, interrupted))
     }
 
     fn lock(&self) -> io::Result<File> {

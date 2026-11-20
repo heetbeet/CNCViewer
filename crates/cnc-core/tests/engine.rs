@@ -1,6 +1,6 @@
 use cnc_core::engine::{inspect, Options};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt::Write};
 fn run(text: &str, setup: Value) -> cnc_core::engine::Model {
     inspect(
         text,
@@ -37,6 +37,34 @@ fn macro_programs_produce_expected_linear_moves() {
             }
         }
     }
+}
+
+#[test]
+fn large_macro_program_preserves_moves_and_variable_snapshots() {
+    let mut text = String::from("G90 G21 G94\n");
+    for x in 1..=12_000 {
+        writeln!(text, "#100=[{x}+ABS[SIN[30]*2-1]]").unwrap();
+        text.push_str("G1 X[#100+COS[0]-1] Y[ABS[FIX[2.9]-4]] F100\n");
+    }
+    text.push_str("M30\n");
+    let model = inspect(
+        &text,
+        "large-macros.nc",
+        &BTreeMap::new(),
+        &Options {
+            capture_variables: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(model.status, "complete", "{:?}", model.diagnostics);
+    assert_eq!(model.moves.len(), 12_000);
+    assert_eq!(model.moves.last().unwrap().end, [12_000., 2., 0.]);
+    assert_eq!(model.executions[2].variables[&100], Some(1.));
+    assert_eq!(
+        model.executions.last().unwrap().variables[&100],
+        Some(12_000.)
+    );
 }
 #[test]
 fn goto_and_macro_slots() {

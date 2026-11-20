@@ -221,26 +221,27 @@ impl Window {
         cc: &eframe::CreationContext<'_>,
         file: Option<PathBuf>,
         receiving: bool,
+        skip_restore: bool,
     ) -> Result<Self, StartupError> {
         let transferred: Option<Project> = receiving
             .then(|| serde_json::from_reader(io::stdin().lock()))
             .transpose()?;
         let viewer = App::new(cc)?;
         let mut session_error = None;
-        let (session, candidates) = if viewer.capture_path.is_none() {
+        let (session, candidates, interrupted) = if viewer.capture_path.is_none() {
             let settings = super::settings_path();
             match Session::start(
                 settings.parent().expect("Settings directory").to_owned(),
-                file.is_none() && !receiving,
+                file.is_none() && !receiving && !skip_restore,
             ) {
-                Ok((session, candidates)) => (Some(session), candidates),
+                Ok((session, candidates, interrupted)) => (Some(session), candidates, interrupted),
                 Err(error) => {
                     session_error = Some(format!("Could not open tab history: {error}"));
-                    (None, Vec::new())
+                    (None, Vec::new(), false)
                 }
             }
         } else {
-            (None, Vec::new())
+            (None, Vec::new(), false)
         };
         let mut window = Self::empty(viewer, session);
         window.acknowledge_transfer = receiving;
@@ -255,7 +256,7 @@ impl Window {
                 }
             }
         } else {
-            let mut restored = restore_projects(&candidates);
+            let mut restored = restore_projects(&candidates, interrupted);
             let discarded = candidates
                 .iter()
                 .filter(|tab| !restored.iter().any(|(_, saved)| tab.id == saved.id))
@@ -282,6 +283,9 @@ impl Window {
                     published: Some(published),
                 });
                 pane.viewer.install_project(project);
+                if interrupted {
+                    pane.viewer.status = "Tabs recovered. Press Plot to resume.".into();
+                }
                 pane.reveal = true;
             }
         }
@@ -614,13 +618,14 @@ impl Window {
     }
 }
 
-fn restore_projects(candidates: &[OpenTab]) -> Vec<(Project, OpenTab)> {
+fn restore_projects(candidates: &[OpenTab], pause_plots: bool) -> Vec<(Project, OpenTab)> {
     let mut seen = BTreeSet::new();
     let mut restored = Vec::new();
     for tab in candidates {
         let path = session::canonical(&tab.path);
         if !seen.contains(&path) {
-            if let Ok(project) = Project::restore(tab) {
+            if let Ok(mut project) = Project::restore(tab) {
+                project.plot_cleared = pause_plots;
                 seen.insert(path);
                 restored.push((project, tab.clone()));
                 if restored.len() == session::RESTORE_LIMIT {
@@ -966,7 +971,8 @@ mod tests {
             std::process::id(),
             session::now()
         ));
-        let (first, empty) = Session::start(root.clone(), true).unwrap();
+        let (first, empty, interrupted) = Session::start(root.clone(), true).unwrap();
+        assert!(!interrupted);
         assert!(empty.is_empty());
         for i in 0..=10 {
             let path = root.join(format!("part-{i}.nc"));
@@ -984,11 +990,11 @@ mod tests {
                 })
                 .unwrap();
         }
-        let (second, suppressed) = Session::start(root.clone(), true).unwrap();
+        let (second, suppressed, _) = Session::start(root.clone(), true).unwrap();
         assert!(suppressed.is_empty(), "A live window prevents restoration");
         second.forget(&BTreeSet::from(["9"])).unwrap();
         drop(first);
-        let (another, suppressed) = Session::start(root.clone(), true).unwrap();
+        let (another, suppressed, _) = Session::start(root.clone(), true).unwrap();
         assert!(
             suppressed.is_empty(),
             "The surviving window still owns a lease"
@@ -996,8 +1002,10 @@ mod tests {
         drop(another);
         drop(second);
 
-        let (reopened, candidates) = Session::start(root.clone(), true).unwrap();
-        let restored = restore_projects(&candidates);
+        let (reopened, candidates, interrupted) = Session::start(root.clone(), true).unwrap();
+        assert!(!interrupted);
+        let restored = restore_projects(&candidates, interrupted);
+        assert!(restored.iter().all(|(project, _)| !project.plot_cleared));
         let ids = restored
             .iter()
             .map(|(_, record)| record.id.as_str())
@@ -1009,6 +1017,18 @@ mod tests {
             .iter()
             .any(|item| item.path.ends_with("part-9.nc")));
         drop(reopened);
+        fs::write(root.join("windows/interrupted.lock"), "").unwrap();
+        let (recovered, candidates, interrupted) = Session::start(root.clone(), true).unwrap();
+        let restored = restore_projects(&candidates, interrupted);
+        assert!(interrupted);
+        assert_eq!(restored.len(), 7);
+        assert!(restored.iter().all(|(project, _)| project.plot_cleared));
+        drop(recovered);
+        let (clean, candidates, interrupted) = Session::start(root.clone(), false).unwrap();
+        assert!(!interrupted);
+        assert!(candidates.is_empty());
+        assert_eq!(clean.recent().unwrap().len(), 11);
+        drop(clean);
         for i in 0..10 {
             fs::remove_file(root.join(format!("part-{i}.nc"))).unwrap();
         }

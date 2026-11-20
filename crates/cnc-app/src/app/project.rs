@@ -21,7 +21,7 @@ pub(super) struct Project {
     camera: Camera,
     resume: Option<PlotPosition>,
     settings: Option<Settings>,
-    plot_cleared: bool,
+    pub(super) plot_cleared: bool,
     find: find::Find,
 }
 

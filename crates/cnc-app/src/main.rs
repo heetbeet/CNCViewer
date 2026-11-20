@@ -65,7 +65,8 @@ fn main() {
         _ => {}
     }
     let receiving_tab = args.first().is_some_and(|arg| arg == "--tab-transfer");
-    let file = if receiving_tab {
+    let skip_restore = args.first().is_some_and(|arg| arg == "--no-restore");
+    let file = if receiving_tab || skip_restore {
         None
     } else {
         args.first().map(std::path::PathBuf::from)
@@ -84,7 +85,14 @@ fn main() {
     if let Err(error) = eframe::run_native(
         "CNC Viewer",
         options,
-        Box::new(move |cc| Ok(Box::new(app::Window::new(cc, file, receiving_tab)?))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::Window::new(
+                cc,
+                file,
+                receiving_tab,
+                skip_restore,
+            )?))
+        }),
     ) {
         eprintln!("{error}");
         std::process::exit(1)

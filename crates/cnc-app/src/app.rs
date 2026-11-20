@@ -1178,6 +1178,14 @@ impl App {
         }
         (axes, inch)
     }
+    fn orbit_drag(&mut self, response: &egui::Response, button: PointerButton) {
+        if response.dragged_by(button) && response.ctx.current_pass_index() == 0 {
+            let motion = response.drag_motion();
+            self.camera.yaw -= f64::from(motion.x) * 0.008;
+            self.camera.pitch = (self.camera.pitch + f64::from(motion.y) * 0.008)
+                .clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+        }
+    }
     fn canvas(&mut self, ui: &mut egui::Ui, sidebar_width: f32) {
         let available = ui.available_size().max(Vec2::splat(1.));
         let (rect, response) = ui.allocate_exact_size(available, Sense::click_and_drag());
@@ -1199,10 +1207,8 @@ impl App {
         if !blocked && response.dragged_by(buttons[self.settings.mouse[0]]) {
             self.camera.pan(delta.x as f64, delta.y as f64)
         }
-        if !blocked && response.dragged_by(buttons[self.settings.mouse[2]]) {
-            self.camera.yaw -= delta.x as f64 * 0.008;
-            self.camera.pitch = (self.camera.pitch + delta.y as f64 * 0.008)
-                .clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+        if !blocked {
+            self.orbit_drag(&response, buttons[self.settings.mouse[2]]);
         }
         if !blocked && response.dragged_by(buttons[self.settings.mouse[1]]) {
             self.camera.zoom((delta.y as f64 * 0.01).exp(), [0.; 2]);
@@ -2190,5 +2196,37 @@ mod tests {
             app.diagnostics[0].error.message,
             "Duplicate sequence label N10"
         );
+
+        for z_up in [true, false] {
+            app.settings.z_up = z_up;
+            app.camera.pitch = 0.12;
+            let heading = app.camera.yaw;
+            let start = egui::pos2(870., 400.);
+            let press = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: PointerButton::Secondary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            };
+            frame(&mut app, vec![egui::Event::PointerMoved(start)]);
+            frame(&mut app, vec![press(start, true)]);
+            for (position, pitch) in [
+                (egui::pos2(870., 390.), 0.04),
+                (egui::pos2(1260., 380.), -0.04),
+                (egui::pos2(1260., 370.), -0.12),
+            ] {
+                frame(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::MouseMoved(Vec2::new(0., -10.)),
+                    ],
+                );
+                assert_eq!(app.camera.yaw, heading);
+                assert!((app.camera.pitch - pitch).abs() < 1e-12);
+                assert!((app.camera.orbit_direction()[2] - pitch.sin()).abs() < 1e-12);
+            }
+            frame(&mut app, vec![press(egui::pos2(1260., 370.), false)]);
+        }
     }
 }

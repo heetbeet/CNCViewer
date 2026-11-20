@@ -1544,12 +1544,7 @@ impl App {
             ui.scope_id().with("view-cube"),
             Sense::click_and_drag(),
         );
-        if response.dragged_by(PointerButton::Secondary) {
-            let delta = ui.input(|i| i.pointer.delta());
-            self.camera.yaw -= delta.x as f64 * 0.008;
-            self.camera.pitch = (self.camera.pitch + delta.y as f64 * 0.008)
-                .clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
-        }
+        self.orbit_drag(&response, PointerButton::Secondary);
         let hit = {
             let project = cube::projector(&self.camera, center);
             let faces = cube::visible(&self.camera, &project);

@@ -43,6 +43,7 @@ pub fn show(args: &[String]) -> bool {
             "CNC Viewer {}\n\
              Open G-code in the desktop viewer or inspect it from an agent workflow.\n\n\
              [FILE]                    Open the desktop viewer\n\
+             --no-restore              Open a fresh window and keep the saved tabs\n\
              inspect FILE|- [JOB.json] Inspect G-code and optionally export evidence\n\
              --help agents            Print the complete CNC Viewer agent guide\n\
              export-skill DIRECTORY   Extract the guide and optional Python helpers",

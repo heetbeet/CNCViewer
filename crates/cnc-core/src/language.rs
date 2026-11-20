@@ -1,5 +1,16 @@
 use serde_json::{json, Value};
 type Result<T> = std::result::Result<T, Value>;
+
+// Move parsed children into the parent. json! would serialize and rebuild each subtree.
+fn node<const N: usize>(kind: &str, fields: [(&str, Value); N]) -> Value {
+    Value::Object(
+        std::iter::once(("type", Value::from(kind)))
+            .chain(fields)
+            .map(|(key, value)| (key.into(), value))
+            .collect(),
+    )
+}
+
 fn failure(message: impl Into<String>, column: Option<usize>) -> Value {
     let mut e = json!({"message":message.into(),"code":"PROGRAM"});
     if let Some(column) = column {
@@ -83,31 +94,32 @@ impl Parser {
     }
     fn variable_inner(&mut self) -> Result<Value> {
         if self.kind() == "named" {
-            return Ok(json!({"type":"named","name":self.next()["value"]}));
+            return Ok(node("named", [("name", self.next()["value"].clone())]));
         }
         self.expect("#")?;
         if self.take("[") {
             let address = self.expression(0)?;
             self.expect("]")?;
-            return Ok(json!({"type":"variable","address":address}));
+            return Ok(node("variable", [("address", address)]));
         }
         if self.value() == "#" || self.kind() == "named" {
             let address = self.variable()?;
-            return Ok(json!({"type":"variable","address":address}));
+            return Ok(node("variable", [("address", address)]));
         }
         if self.kind() != "number" {
             return Err(
                 self.error("Expected a variable number, name or bracketed address after '#'.")
             );
         }
-        Ok(json!({"type":"variable","address":{"type":"number","value":self.next()["value"]}}))
+        let address = node("number", [("value", self.next()["value"].clone())]);
+        Ok(node("variable", [("address", address)]))
     }
     fn expression(&mut self, minimum: u32) -> Result<Value> {
         self.bounded(|parser| parser.expression_inner(minimum))
     }
     fn expression_inner(&mut self, minimum: u32) -> Result<Value> {
         let left = if self.kind() == "number" {
-            json!({"type":"number","value":self.next()["value"]})
+            node("number", [("value", self.next()["value"].clone())])
         } else if self.value() == "#" || self.kind() == "named" {
             self.variable()?
         } else if self.take("[") {
@@ -116,7 +128,10 @@ impl Parser {
             value
         } else if ["+", "-", "NOT"].contains(&self.value()) {
             let operator = self.next()["value"].clone();
-            json!({"type":"unary","operator":operator,"operand":self.expression(40)?})
+            node(
+                "unary",
+                [("operator", operator), ("operand", self.expression(40)?)],
+            )
         } else if [
             "ABS", "ROUND", "FIX", "FUP", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "SQRT",
             "LN", "EXP", "BIN", "BCD", "PRM",
@@ -142,7 +157,7 @@ impl Parser {
                 args.push(self.expression(0)?);
                 self.expect("]")?
             }
-            json!({"type":"function","name":name,"args":args})
+            node("function", [("name", name), ("args", Value::Array(args))])
         } else {
             return Err(self.error(format!(
                 "Expected a number or expression, found '{}'.",
@@ -177,11 +192,10 @@ impl Parser {
         if operations.is_empty() {
             Ok(left)
         } else {
-            Ok(Value::Object(serde_json::Map::from_iter([
-                ("type".into(), Value::String("chain".into())),
-                ("first".into(), left),
-                ("operations".into(), Value::Array(operations)),
-            ])))
+            Ok(node(
+                "chain",
+                [("first", left), ("operations", Value::Array(operations))],
+            ))
         }
     }
     fn statements(&mut self) -> Result<Vec<Value>> {
@@ -202,9 +216,15 @@ impl Parser {
                 if consequent.is_empty() {
                     return Err(self.error("IF requires a statement or GOTO target."));
                 }
-                items.push(json!({"type":"if","condition":condition,"consequent":consequent}));
+                items.push(node(
+                    "if",
+                    [
+                        ("condition", condition),
+                        ("consequent", Value::Array(consequent)),
+                    ],
+                ));
             } else if self.take("GOTO") {
-                items.push(json!({"type":"goto","target":self.expression(0)?}));
+                items.push(node("goto", [("target", self.expression(0)?)]));
             } else if self.take("WHILE") {
                 self.expect("[")?;
                 let condition = self.expression(0)?;
@@ -220,7 +240,10 @@ impl Parser {
                     1.,
                     99999999.,
                 )?;
-                items.push(json!({"type":"while","condition":condition,"id":id}));
+                items.push(node(
+                    "while",
+                    [("condition", condition), ("id", Value::from(id))],
+                ));
             } else if self.take("END") {
                 let id = self.next();
                 if id["kind"] != "number" {
@@ -236,7 +259,10 @@ impl Parser {
             } else if self.value() == "#" || self.kind() == "named" {
                 let target = self.variable()?;
                 self.expect("=")?;
-                items.push(json!({"type":"assign","target":target,"value":self.expression(0)?}));
+                items.push(node(
+                    "assign",
+                    [("target", target), ("value", self.expression(0)?)],
+                ));
             } else if self.kind() == "address" || self.value() == ":" {
                 let letter = self.next()["value"].as_str().unwrap().to_owned();
                 let start = self.index;
@@ -268,7 +294,18 @@ impl Parser {
                 } else {
                     Value::Null
                 };
-                items.push(json!({"type":"word","letter":if letter==":"{"O"}else{&letter},"value":value,"decimalLiteral":decimal,"rawLiteral":text}));
+                items.push(node(
+                    "word",
+                    [
+                        (
+                            "letter",
+                            Value::from(if letter == ":" { "O" } else { &letter }),
+                        ),
+                        ("value", value),
+                        ("decimalLiteral", Value::Bool(decimal)),
+                        ("rawLiteral", text),
+                    ],
+                ));
             } else {
                 return Err(self.error(format!("Unexpected '{}' in a block.", self.value())));
             }
