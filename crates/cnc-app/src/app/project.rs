@@ -162,6 +162,7 @@ impl App {
     pub(super) fn take_project(&mut self) -> Project {
         self.cancel_plot();
         self.highlight_cache.clear();
+        self.playback_rows.clear();
         self.find.results = None;
         Project {
             id: std::mem::take(&mut self.project_id),

@@ -243,16 +243,17 @@ fn find_button(
 pub(super) fn match_highlights(
     results: &Results,
     text: &str,
-    output: &TextEditOutput,
+    layout: CodeLayout<'_>,
     painter: &Painter,
     dark: bool,
 ) -> Shape {
     let clip = painter.clip_rect();
-    let origin = output.galley_pos;
-    let rows = &output.galley.rows;
+    let origin = layout.origin;
+    let rows = &layout.galley.rows;
     let first = rows.partition_point(|row| origin.y + row.max_y() < clip.min.y);
     let mut highlights = Vec::new();
     for (index, row) in rows.iter().enumerate().skip(first) {
+        let index = layout.first_row + index;
         if origin.y + row.min_y() > clip.max.y {
             break;
         }

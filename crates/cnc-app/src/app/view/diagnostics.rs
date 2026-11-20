@@ -1,6 +1,6 @@
 use super::*;
 use cnc_core::error::UNASSIGNED_VARIABLE;
-use egui::{layers::ShapeIdx, text_edit::TextEditOutput, Painter, Shape};
+use egui::{layers::ShapeIdx, Painter, Shape};
 
 pub(super) fn for_source<'a>(diagnostics: &'a [Diagnostic], source: &str) -> &'a [Diagnostic] {
     let start = diagnostics.partition_point(|note| note.source.as_str() < source);
@@ -12,16 +12,16 @@ pub(super) fn paint(
     ui: &mut egui::Ui,
     painter: &Painter,
     background: ShapeIdx,
-    output: &TextEditOutput,
+    layout: CodeLayout<'_>,
     notes: &[Diagnostic],
     size: f32,
     dark: bool,
 ) {
     let clip = painter.clip_rect();
-    let origin = output.galley_pos;
-    let rows = &output.galley.rows;
-    let first = rows.partition_point(|row| origin.y + row.max_y() <= clip.min.y);
-    let last = rows.partition_point(|row| origin.y + row.min_y() < clip.max.y);
+    let origin = layout.origin;
+    let rows = &layout.galley.rows;
+    let first = layout.first_row + rows.partition_point(|row| origin.y + row.max_y() <= clip.min.y);
+    let last = layout.first_row + rows.partition_point(|row| origin.y + row.min_y() < clip.max.y);
     let mut notes = &notes[notes.partition_point(|note| note.line <= first)..];
     let mut bands = Vec::new();
     while let Some(note) = notes.first().filter(|note| note.line <= last) {
@@ -58,7 +58,9 @@ pub(super) fn paint(
         if message.contains(['\r', '\n']) {
             message = message.replace(['\r', '\n'], " ");
         }
-        let row = rows[line - 1].rect().translate(origin.to_vec2());
+        let row = rows[line - 1 - layout.first_row]
+            .rect()
+            .translate(origin.to_vec2());
         let band = Rect::from_min_max(
             Pos2::new(clip.min.x, row.min.y),
             Pos2::new(clip.max.x, row.max.y),

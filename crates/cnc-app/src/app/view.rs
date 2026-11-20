@@ -14,6 +14,47 @@ pub(super) struct Highlight {
     rows: Option<(usize, usize)>,
     galley: Arc<egui::Galley>,
 }
+
+pub(super) struct SourceRows {
+    starts: Vec<(usize, usize)>,
+    widest: usize,
+}
+
+impl SourceRows {
+    fn new(source: &str) -> Self {
+        let mut starts = vec![(0, 0)];
+        let mut widest = 0;
+        let mut byte = 0;
+        let mut depth = 0;
+        for line in source.split_inclusive('\n') {
+            let columns = line
+                .trim_end_matches(['\r', '\n'])
+                .chars()
+                .map(|c| if c == '\t' { 4 } else { 1 })
+                .sum();
+            widest = widest.max(columns);
+            byte += line.len();
+            if line.ends_with('\n') {
+                depth = comment_depth(line, depth);
+                starts.push((byte, depth));
+            }
+        }
+        Self { starts, widest }
+    }
+
+    fn window<'a>(&self, source: &'a str, first: usize, end: usize) -> (&'a str, usize) {
+        let (start, depth) = self.starts[first];
+        let end = self.starts.get(end).map_or(source.len(), |row| row.0);
+        (&source[start..end], depth)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CodeLayout<'a> {
+    first_row: usize,
+    origin: Pos2,
+    galley: &'a egui::Galley,
+}
 pub(super) const TOOLBAR_HEIGHT: f32 = 36.;
 const SIDEBAR_GUTTER: f32 = 28.;
 pub(super) const MIN_SIDEBAR_WIDTH: f32 = 240. + SIDEBAR_GUTTER;
@@ -919,6 +960,37 @@ impl App {
         let notes = diagnostics::for_source(&self.diagnostics, &selected);
         let line = self.selected_line;
         let text = self.documents.entry(selected.clone()).or_default();
+        let editor_focused = e.memory(|memory| memory.has_focus(id));
+        let editor_input = e.input(|input| {
+            (editor_focused
+                && input.events.iter().any(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::PointerMoved(_)
+                            | egui::Event::MouseMoved(_)
+                            | egui::Event::MouseWheel { .. }
+                    )
+                }))
+                || ((input.pointer.primary_down()
+                    || input.pointer.button_released(PointerButton::Primary))
+                    && input
+                        .pointer
+                        .interact_pos()
+                        .is_some_and(|pos| edit_rect.contains(pos)))
+        });
+        let reveal_match = self.find.open
+            && self.find.reveal
+            && self
+                .find
+                .results
+                .as_ref()
+                .is_some_and(|results| results.current().is_some());
+        let playback_rows =
+            (self.running && text.len() > 131_072 && !editor_input && !reveal_match).then(|| {
+                self.playback_rows
+                    .entry(selected.clone())
+                    .or_insert_with(|| SourceRows::new(text))
+            });
         let mut scroll = egui::ScrollArea::both()
             .id_salt(("code-scroll", &self.project_id, &selected))
             .auto_shrink([false, false]);
@@ -958,7 +1030,10 @@ impl App {
         let mut changed = false;
         scroll.show_viewport(&mut e, |ui, viewport| {
             let origin = ui.cursor().min;
-            let lines = text.bytes().filter(|&byte| byte == b'\n').count() + 1;
+            let lines = playback_rows.as_ref().map_or_else(
+                || text.bytes().filter(|&byte| byte == b'\n').count() + 1,
+                |rows| rows.starts.len(),
+            );
             let gutter = Rect::from_min_size(
                 origin,
                 Vec2::new(47., (lines as f32 * line_height).max(edit_rect.height())),
@@ -1014,6 +1089,64 @@ impl App {
                         Color32::from_gray(80)
                     },
                 );
+            }
+            if let Some(rows) = playback_rows.as_ref() {
+                let first = first.min(lines - 1);
+                let width = ui.fonts_mut(|fonts| fonts.glyph_width(&FontId::monospace(size), '0'));
+                let text_origin = origin + Vec2::new(49., 0.);
+                let code_width = (rows.widest as f32 * width).max(viewport.width() - 49.);
+                let code_height = lines as f32 * line_height;
+                let code_rect =
+                    Rect::from_min_size(text_origin, Vec2::new(code_width, code_height));
+                ui.interact(code_rect, id, Sense::click_and_drag());
+                let last_content = lines.saturating_sub(1 + usize::from(text.ends_with('\n')));
+                ui.expand_to_include_rect(Rect::from_min_max(
+                    origin,
+                    Pos2::new(
+                        code_rect.max.x,
+                        origin.y
+                            + code_height
+                                .max(last_content as f32 * line_height + viewport.height()),
+                    ),
+                ));
+                let (slice, depth) = rows.window(text, first, last.max(first + 1));
+                let galley = ui.fonts_mut(|fonts| {
+                    fonts.layout_job(highlight_range(
+                        slice,
+                        size,
+                        line_height,
+                        dark,
+                        0..slice.len(),
+                        depth,
+                    ))
+                });
+                let layout = CodeLayout {
+                    first_row: first,
+                    origin: text_origin + Vec2::new(0., first as f32 * line_height),
+                    galley: &galley,
+                };
+                let painter = ui.painter();
+                if let Some(results) = self
+                    .find
+                    .results
+                    .as_ref()
+                    .filter(|r| self.find.open && !r.ranges.is_empty())
+                {
+                    painter.add(find::match_highlights(results, text, layout, painter, dark));
+                }
+                painter.galley(layout.origin, galley.clone(), Color32::BLACK);
+                if let Some(background) = diagnostic_background {
+                    diagnostics::paint(
+                        ui,
+                        &diagnostic_painter,
+                        background,
+                        layout,
+                        notes,
+                        size,
+                        dark,
+                    );
+                }
+                return;
             }
             let mut body = ui.new_child(
                 UiBuilder::new()
@@ -1100,12 +1233,17 @@ impl App {
                 changed = true;
                 return;
             }
+            let layout = CodeLayout {
+                first_row: 0,
+                origin: output.galley_pos,
+                galley: &output.galley,
+            };
             if let Some(background) = diagnostic_background {
                 diagnostics::paint(
                     ui,
                     &diagnostic_painter,
                     background,
-                    &output,
+                    layout,
                     notes,
                     size,
                     dark,
@@ -1114,7 +1252,7 @@ impl App {
             if let (Some(shape), Some(results)) = (search_shape, &self.find.results) {
                 search_painter.set(
                     shape,
-                    find::match_highlights(results, text, &output, &search_painter, dark),
+                    find::match_highlights(results, text, layout, &search_painter, dark),
                 );
                 if std::mem::take(&mut self.find.reveal) {
                     find::reveal_match(results, text, &output, ui);
@@ -1830,6 +1968,52 @@ fn highlight(
     dark: bool,
     rows: Option<(usize, usize)>,
 ) -> egui::text::LayoutJob {
+    let (start, end) = if let Some((first, last)) = rows {
+        let mut breaks = text.match_indices('\n');
+        let start = if first == 0 {
+            0
+        } else {
+            breaks.nth(first - 1).map_or(text.len(), |(i, _)| i + 1)
+        };
+        let end = breaks
+            .nth(last - first - 1)
+            .map_or(text.len(), |(i, _)| i + 1);
+        (start, end)
+    } else {
+        (0, text.len())
+    };
+    highlight_range(
+        text,
+        size,
+        line_height,
+        dark,
+        start..end,
+        comment_depth(&text[..start], 0),
+    )
+}
+
+fn comment_depth(text: &str, mut depth: usize) -> usize {
+    let mut line_comment = false;
+    for byte in text.bytes() {
+        match byte {
+            b'\n' => line_comment = false,
+            b'(' if !line_comment => depth += 1,
+            b')' if !line_comment && depth > 0 => depth -= 1,
+            b';' if depth == 0 => line_comment = true,
+            _ => {}
+        }
+    }
+    depth
+}
+
+fn highlight_range(
+    text: &str,
+    size: f32,
+    line_height: f32,
+    dark: bool,
+    std::ops::Range { start, end }: std::ops::Range<usize>,
+    mut comment: usize,
+) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let foreground = if dark {
         Color32::from_rgb(248, 248, 242)
@@ -1859,31 +2043,6 @@ fn highlight(
             });
         }
     };
-    let (start, end) = if let Some((first, last)) = rows {
-        let mut breaks = text.match_indices('\n');
-        let start = if first == 0 {
-            0
-        } else {
-            breaks.nth(first - 1).map_or(text.len(), |(i, _)| i + 1)
-        };
-        let end = breaks
-            .nth(last - first - 1)
-            .map_or(text.len(), |(i, _)| i + 1);
-        (start, end)
-    } else {
-        (0, text.len())
-    };
-    let mut comment = 0;
-    let mut line_comment = false;
-    for byte in text[..start].bytes() {
-        match byte {
-            b'\n' => line_comment = false,
-            b'(' if !line_comment => comment += 1,
-            b')' if !line_comment && comment > 0 => comment -= 1,
-            b';' if comment == 0 => line_comment = true,
-            _ => {}
-        }
-    }
     append(0, start, foreground);
     let bytes = &text.as_bytes()[..end];
     let mut i = start;
@@ -1982,5 +2141,17 @@ mod tests {
             .sections
             .iter()
             .any(|s| s.format.color == Color32::from_rgb(35, 110, 36)));
+    }
+
+    #[test]
+    fn playback_window_retains_comments_started_offscreen() {
+        let source = "; ignore (\r\n(🛠\r\ncontinued) G1 X2\r\nM30\r\n";
+        let rows = SourceRows::new(source);
+        let (slice, depth) = rows.window(source, 2, 3);
+        assert_eq!(slice, "continued) G1 X2\r\n");
+        assert_eq!(depth, 1);
+        assert_eq!(rows.window(source, 4, 5), ("", 0));
+        let job = highlight_range(slice, 12., 14., false, 0..slice.len(), depth);
+        assert_eq!(job.sections[0].format.color, Color32::from_rgb(35, 110, 36));
     }
 }

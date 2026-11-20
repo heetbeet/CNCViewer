@@ -172,6 +172,7 @@ pub struct App {
     block_elapsed: f64,
     last_stop: Option<usize>,
     highlight_cache: BTreeMap<String, view::Highlight>,
+    playback_rows: BTreeMap<String, view::SourceRows>,
 }
 impl App {
     pub fn new(
@@ -316,6 +317,7 @@ impl App {
             block_elapsed: 0.,
             last_stop: None,
             highlight_cache: BTreeMap::new(),
+            playback_rows: BTreeMap::new(),
         }
     }
     fn replot(&mut self) {
@@ -366,6 +368,7 @@ impl App {
     }
     fn edited(&mut self, ctx: &egui::Context) {
         self.edited_at = session::now();
+        self.playback_rows.remove(&self.selected);
         if self.disk.files.get(&self.selected).is_some_and(|file| {
             self.documents
                 .get(&self.selected)
@@ -2220,5 +2223,48 @@ mod tests {
             }
             frame(&mut app, vec![press(egui::pos2(1260., 370.), false)]);
         }
+
+        let name = "large-playback.tap";
+        let mut source = "(A comment outside the playback viewport)\n".repeat(3500);
+        source.push_str("G0 X0\nG1 X44 F100\nM30\n");
+        app.documents.insert(name.into(), source.clone());
+        app.main = name.into();
+        app.selected = name.into();
+        app.find = Default::default();
+        app.diagnostics.clear();
+        app.preview_stale = false;
+        app.model =
+            Arc::new(inspect(&source, name, &Default::default(), &Default::default()).unwrap());
+        app.seek(3501);
+        app.play(true);
+        let shapes = frame(&mut app, vec![]);
+        let snippet = shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(shape) if shape.galley.job.text.contains("G1 X44 F100") => {
+                    Some(shape)
+                }
+                _ => None,
+            })
+            .expect("Playback must display the active code");
+        let visible = &snippet.galley.job.text;
+        assert!(visible.len() < 5000, "Playback shaped offscreen code");
+        let row = visible[..visible.find("G1 X44 F100").unwrap()]
+            .matches('\n')
+            .count();
+        let code = snippet.pos + Vec2::new(25., snippet.galley.rows[row].rect().center().y);
+        click(&mut app, code.x, code.y);
+        assert!(
+            !app.running,
+            "Clicking a running line must select its execution"
+        );
+        assert_eq!(app.selected_line, 3502);
+
+        let editor = app.editor_id();
+        app.play(true);
+        ctx.memory_mut(|memory| memory.request_focus(editor));
+        frame(&mut app, vec![egui::Event::Text("(edited)".into())]);
+        assert!(!app.running);
+        assert!(app.documents[name].contains("(edited)"));
     }
 }
