@@ -39,11 +39,16 @@ pub(super) fn show(ui: &egui::Ui, band: Rect, controls_right: f32) {
     const MARK_SIZE: f32 = 16.;
     const BADGE_SIZE: f32 = 24.;
     const INK: Color32 = Color32::from_rgb(54, 66, 61);
+    const MARK_INK: Color32 = Color32::from_rgb(40, 108, 75);
     if band.right() + 1. < ui.ctx().input(|input| input.content_rect().right()) {
         return;
     }
     let painter = ui.painter();
-    let label = painter.layout_no_wrap("Inspired by".into(), FontId::proportional(12.), INK);
+    let label = painter.layout_no_wrap(
+        "Inspired by Toolpath Labs".into(),
+        FontId::proportional(12.),
+        INK,
+    );
     let text_size = label.size();
     let width = 8. + text_size.x + 6. + 2. * BADGE_SIZE + 5.;
     let left = band.right() - 9. - width;
@@ -78,7 +83,7 @@ pub(super) fn show(ui: &egui::Ui, band: Rect, controls_right: f32) {
                 mark.id(),
                 Rect::from_center_size(rect.center(), fitted),
                 Rect::from_min_max(Pos2::ZERO, pos2(1., 1.)),
-                Color32::WHITE,
+                MARK_INK,
             );
         }
         x += BADGE_SIZE;

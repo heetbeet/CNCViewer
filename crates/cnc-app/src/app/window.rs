@@ -1256,7 +1256,7 @@ mod tests {
         let credit_text = toolbar
             .iter()
             .find_map(|shape| match &shape.shape {
-                egui::Shape::Text(text) if text.galley.job.text == "Inspired by" => {
+                egui::Shape::Text(text) if text.galley.job.text == "Inspired by Toolpath Labs" => {
                     Some(text.pos + text.galley.size() / 2.)
                 }
                 _ => None,
