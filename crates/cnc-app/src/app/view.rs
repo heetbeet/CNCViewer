@@ -1553,22 +1553,16 @@ impl App {
                 .and_then(|position| faces.iter().position(|face| face.contains(position)));
             let alpha = if response.hovered() { 255 } else { 125 };
             let p = ui.painter();
-            for (root, tip, tint) in [
-                ([0.50, 0., 0.], [0.85, 0., 0.], [205, 65, 52]),
-                ([0., -0.50, 0.], [0., -0.85, 0.], [55, 108, 211]),
-                ([0., 0., 0.5], [0., 0., 0.85], [120, 200, 39]),
-            ] {
-                let [r, g, b] = tint;
-                p.line_segment(
-                    [project(root), project(tip)],
-                    Stroke::new(0.9, Color32::from_rgba_unmultiplied(r, g, b, alpha)),
-                );
-            }
+            let axes = cube::axes(&self.camera, center);
+            cube::paint_axes(p, &axes, false);
             for (index, face) in faces.iter().enumerate() {
                 let fill = if hovered == Some(index) {
                     Color32::from_rgb(33, 150, 243)
+                } else if response.hovered() {
+                    Color32::from_rgb(207, 216, 220)
                 } else {
-                    Color32::from_rgba_unmultiplied(207, 216, 220, alpha)
+                    // Match the light idle tint with an opaque face so rear guides are masked.
+                    Color32::from_rgb(225, 229, 231)
                 };
                 p.add(egui::Shape::convex_polygon(
                     face.points().to_vec(),
@@ -1576,11 +1570,12 @@ impl App {
                     Stroke::new(0.7, Color32::from_rgba_unmultiplied(25, 118, 162, alpha)),
                 ));
             }
+            cube::paint_axes(p, &axes, true);
             hovered.map(|index| faces[index].normal)
         };
         if self.camera.orbit_direction()[2] < -1e-8 {
             ui.painter().text(
-                center + Vec2::new(0., 37.),
+                center + Vec2::new(0., 70.),
                 Align2::CENTER_TOP,
                 "Underside",
                 FontId::proportional(10.),
@@ -1593,7 +1588,7 @@ impl App {
                 self.camera.view_direction(direction);
             }
         }
-        let home = Rect::from_center_size(center + Vec2::new(-51., -35.), Vec2::splat(30.));
+        let home = Rect::from_center_size(center + Vec2::new(-73., -45.), Vec2::splat(30.));
         if button(
             ui,
             home,
