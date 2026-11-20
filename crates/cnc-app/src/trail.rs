@@ -1,4 +1,4 @@
-use crate::render::run_ids;
+use crate::render::LIVE_SEGMENT;
 use cnc_core::engine::{Model, Segment};
 use cnc_core::geometry::{interpolate, Point};
 use eframe::wgpu::{self, util::DeviceExt};
@@ -11,7 +11,7 @@ struct SweepVertex {
     owner: u32,
 }
 
-type SweepRange = (usize, u32, u32, u32);
+type SweepRange = (usize, u32, u32);
 
 #[derive(Clone)]
 pub struct PreparedTrail {
@@ -61,7 +61,7 @@ impl Trail {
             let mut ds = depth();
             use wgpu::{CompareFunction as Compare, StencilOperation as Stencil};
             // Flat plots count brush coats. Depth-supported plots store the nearest
-            // sweep separately so the resolve can compare it with the wire's run.
+            // sweep separately so the resolve can compare it with the visible wire.
             let (depth_compare, compare, pass_op, read_mask, write_mask) = match kind {
                 Pass::Paint => (
                     Compare::Less,
@@ -227,7 +227,7 @@ impl Trail {
         let mut previous = None;
         let mut brush_start = 0;
         let mut prior_index = 0;
-        for (index, (segment, owner)) in model.segments.iter().zip(run_ids(model)).enumerate() {
+        for (index, segment) in model.segments.iter().enumerate() {
             if index % 256 == 0
                 && cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
             {
@@ -257,9 +257,9 @@ impl Trail {
                 segment.end,
                 radius,
                 origin,
-                owner,
+                index as u32 + 1,
             );
-            ranges.push((index + 1, brush_start, vertices.len() as u32, owner));
+            ranges.push((index + 1, brush_start, vertices.len() as u32));
             previous = Some((segment.end, segment.tool, d));
             prior_index = index;
         }
@@ -305,7 +305,7 @@ impl Trail {
                 .binary_search_by_key(&(index + 1), |range| range.0)
                 .ok()
                 .map(|position| self.ranges[position]);
-            if let Some((_, brush, _, owner)) = range {
+            if let Some((_, brush, _)) = range {
                 let mut vertices = Vec::with_capacity(150);
                 let end = interpolate(segment.start, segment.end, fraction);
                 capsule(
@@ -314,7 +314,7 @@ impl Trail {
                     end,
                     segment.tool_diameter.unwrap_or(self.diameter) / 2.,
                     origin,
-                    owner,
+                    LIVE_SEGMENT,
                 );
                 queue.write_buffer(&self.partial_vertices, 0, bytemuck::cast_slice(&vertices));
                 self.partial = Some((index, fraction, brush, vertices.len() as u32));

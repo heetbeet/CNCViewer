@@ -3,19 +3,23 @@ use cnc_core::engine::Model;
 use cnc_core::geometry::Point;
 use eframe::wgpu::{self, util::DeviceExt};
 use std::{io::BufWriter, path::Path};
+
+const AXIS_FIRST: u32 = 0xff_ff_fc;
+pub(crate) const LIVE_SEGMENT: u32 = 0xff_ff_ff;
+
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
     point: [f32; 3],
     color: u32,
     owner: u32,
-    direction: [f32; 3],
+    detail: [f32; 3],
 }
 impl Vertex {
-    fn path(point: Point, direction: [f32; 3], rapid: bool, owner: u32) -> Self {
+    fn path(point: Point, detail: [f32; 3], rapid: bool, owner: u32) -> Self {
         Self {
             point: point.map(|coordinate| coordinate as f32),
-            direction,
+            detail,
             owner,
             color: u32::from_le_bytes(if rapid {
                 [251, 140, 0, 166]
@@ -24,25 +28,6 @@ impl Vertex {
             }),
         }
     }
-}
-
-pub(crate) fn run_ids(model: &Model) -> impl Iterator<Item = u32> + '_ {
-    model
-        .segments
-        .iter()
-        .enumerate()
-        .scan(0, |run, (i, segment)| {
-            if segment.rapid || i == 0 || {
-                let previous = &model.segments[i - 1];
-                previous.rapid
-                    || previous.end != segment.start
-                    || previous.tool != segment.tool
-                    || previous.tool_diameter != segment.tool_diameter
-            } {
-                *run = i as u32 + 1;
-            }
-            Some(*run)
-        })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -76,7 +61,6 @@ pub struct PreparedPlot {
     grid_count: u32,
     origin: [f64; 3],
     depth_extent: f64,
-    runs: std::sync::Arc<[u32]>,
     five_axis: bool,
     trail: Option<crate::trail::PreparedTrail>,
     pub trail_error: Option<String>,
@@ -108,9 +92,10 @@ pub struct Plot {
     sampled_depth: wgpu::TextureView,
     depth_resolve: wgpu::RenderPipeline,
     depth_frame: Option<DepthFrame>,
+    depth_geometry: Option<wgpu::BindGroup>,
     trail: crate::trail::Trail,
     msaa: wgpu::TextureView,
-    last_frame: Option<([f32; 20], Draw)>,
+    last_frame: Option<([f32; 24], Draw)>,
     points: wgpu::RenderPipeline,
     points_bind: wgpu::BindGroup,
     tool: wgpu::RenderPipeline,
@@ -119,7 +104,6 @@ pub struct Plot {
     five_axis: bool,
     origin: [f64; 3],
     depth_extent: f64,
-    runs: std::sync::Arc<[u32]>,
 }
 impl Plot {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
@@ -175,7 +159,7 @@ impl Plot {
         );
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("CNC camera"),
-            size: 80,
+            size: 96,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -227,7 +211,9 @@ impl Plot {
         let live = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Live tool and partial movement"),
             size: std::mem::size_of::<LiveVertices>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let points = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -288,7 +274,7 @@ impl Plot {
         let vertices = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Empty path"),
             size: size_of::<Vertex>() as u64,
-            usage: wgpu::BufferUsages::VERTEX,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
         let texture = Self::texture(&device, [1, 1]);
@@ -325,6 +311,7 @@ impl Plot {
             sampled_depth,
             depth_resolve,
             depth_frame: None,
+            depth_geometry: None,
             trail,
             msaa,
             last_frame: None,
@@ -336,7 +323,6 @@ impl Plot {
             five_axis: true,
             origin: [0.; 3],
             depth_extent: 1.,
-            runs: Default::default(),
             device,
             queue,
             texture,
@@ -455,7 +441,13 @@ impl Plot {
             return Err("Plot cancelled".into());
         }
         let bytes_per_segment = (2 * std::mem::size_of::<Vertex>()) as u64;
-        if model.segments.len() as u64 > device.limits().max_buffer_size / bytes_per_segment {
+        let limits = device.limits();
+        let max_bytes = limits
+            .max_buffer_size
+            .min(limits.max_storage_buffer_binding_size);
+        if model.segments.len() as u64 > max_bytes / bytes_per_segment
+            || model.segments.len() >= AXIS_FIRST as usize
+        {
             return Err(
                 "Toolpath exceeds the graphics buffer limit. Plot a shorter file or prefix.".into(),
             );
@@ -484,18 +476,19 @@ impl Plot {
         ] {
             let mut end = [0.; 3];
             end[axis] = half as f32;
-            let direction = std::array::from_fn(|index| if index == axis { 1. } else { 0. });
+            let owner = AXIS_FIRST + axis as u32;
+            let detail = [0., 0., end[2]];
             grid.push(Vertex {
                 point: origin.map(|v| -v as f32),
                 color: u32::from_le_bytes(start_color),
-                direction,
-                ..Default::default()
+                owner,
+                detail,
             });
             grid.push(Vertex {
                 point: std::array::from_fn(|i| (end[i] as f64 - origin[i]) as f32),
                 color: u32::from_le_bytes(end_color),
-                direction,
-                ..Default::default()
+                owner,
+                detail,
             });
         }
         for n in -10..=10 {
@@ -522,13 +515,12 @@ impl Plot {
         let grid = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Grid and axes"),
             contents: bytemuck::cast_slice(&grid),
-            usage: wgpu::BufferUsages::VERTEX,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
         });
 
         let mut vertices = Vec::with_capacity(model.segments.len() * 2);
-        let runs: std::sync::Arc<[_]> = run_ids(model).collect();
         let mut depth_extent = 1_f64;
-        for (index, (segment, &owner)) in model.segments.iter().zip(runs.iter()).enumerate() {
+        for (index, segment) in model.segments.iter().enumerate() {
             if index % 256 == 0 && cancelled() {
                 return Err("Plot cancelled".into());
             }
@@ -544,13 +536,22 @@ impl Plot {
                 };
                 std::array::from_fn::<_, 3, _>(|i| p[i] - origin[i])
             });
-            let direction = std::array::from_fn(|i| (endpoints[1][i] - endpoints[0][i]) as f32);
+            let detail = [
+                segment.tool_diameter.unwrap_or(0.) as f32,
+                0.,
+                (endpoints[1][2] - endpoints[0][2]) as f32,
+            ];
             for relative in endpoints {
                 depth_extent = relative
                     .into_iter()
                     .map(f64::abs)
                     .fold(depth_extent, f64::max);
-                vertices.push(Vertex::path(relative, direction, segment.rapid, owner));
+                vertices.push(Vertex::path(
+                    relative,
+                    detail,
+                    segment.rapid,
+                    index as u32 + 1,
+                ));
             }
         }
         if cancelled() {
@@ -561,7 +562,7 @@ impl Plot {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Native path vertices"),
                 contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
             })
         });
         let (trail, trail_error) = match diameter {
@@ -580,7 +581,6 @@ impl Plot {
             grid_count,
             origin,
             depth_extent,
-            runs,
             five_axis,
             trail,
             trail_error,
@@ -595,7 +595,7 @@ impl Plot {
         self.grid_count = geometry.grid_count;
         self.origin = geometry.origin;
         self.depth_extent = geometry.depth_extent;
-        self.runs = geometry.runs;
+        self.depth_geometry = None;
         self.five_axis = geometry.five_axis;
         self.last_frame = None;
         self.trail.invalidate();
@@ -611,7 +611,6 @@ impl Plot {
             grid_count: self.grid_count,
             origin: self.origin,
             depth_extent: self.depth_extent,
-            runs: self.runs.clone(),
             five_axis: self.five_axis,
             trail: self.trail.prepared(),
             trail_error: None,
@@ -620,7 +619,7 @@ impl Plot {
     pub fn clear(&mut self) {
         self.count = 0;
         self.grid_count = 0;
-        self.runs = Default::default();
+        self.depth_geometry = None;
         self.last_frame = None;
         self.trail.invalidate();
     }
@@ -655,10 +654,9 @@ impl Plot {
             point
         };
         if let Some((points, rapid)) = live.motion {
-            let direction = std::array::from_fn(|i| (points[1][i] - points[0][i]) as f32);
-            let owner = self.runs.get(segments).copied().unwrap_or(0xff_ff_ff);
+            let detail = [0., 0., (points[1][2] - points[0][2]) as f32];
             live_vertices.motion =
-                points.map(|point| Vertex::path(to_relative(point), direction, rapid, owner));
+                points.map(|point| Vertex::path(to_relative(point), detail, rapid, LIVE_SEGMENT));
         }
         if let Some(points) = live.tool {
             live_vertices.tool =
@@ -672,6 +670,7 @@ impl Plot {
             extent,
             show_rapid,
             dpi,
+            self.trail.diameter(),
         );
         uniform[15] = if depth_support {
             if sweep {
@@ -688,6 +687,17 @@ impl Plot {
         }
         self.last_frame = Some(signature);
         let sweep_size = if sweep { size } else { [1, 1] };
+        if depth_support && self.depth_geometry.is_none() {
+            let entries = [&self.vertices, &self.grid, &self.live];
+            self.depth_geometry = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Halo segment geometry"),
+                layout: &self.depth_resolve.get_bind_group_layout(1),
+                entries: &std::array::from_fn::<_, 3, _>(|i| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: entries[i].as_entire_binding(),
+                }),
+            }));
+        }
         if depth_support
             && self
                 .depth_frame
@@ -855,6 +865,11 @@ impl Plot {
             });
             pass.set_pipeline(&self.depth_resolve);
             pass.set_bind_group(0, &frame.bind, &[]);
+            pass.set_bind_group(
+                1,
+                self.depth_geometry.as_ref().expect("Depth geometry"),
+                &[],
+            );
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([encoder.finish()]);
@@ -1452,9 +1467,14 @@ mod tests {
         let flat = depth_fixture(&source, &camera, false, false, "dense");
         let depth = depth_fixture(&source, &camera, true, true, "dense");
         let mut blue_samples = 0;
-        for (plain, supported) in flat.iter().zip(&depth) {
+        for (i, (plain, supported)) in flat.iter().zip(&depth).enumerate() {
             if plain[2] > 190 && plain[0] < 160 {
-                assert!(supported[0] <= plain[0] + 2, "{plain:?} -> {supported:?}");
+                assert!(
+                    supported[0] <= plain[0] + 2,
+                    "pixel {} {}: {plain:?} -> {supported:?}",
+                    i % 96,
+                    i / 96
+                );
                 blue_samples += 1;
             }
         }
@@ -1515,6 +1535,57 @@ mod tests {
             depth[rear]
         );
         assert!(flat[rear][0].abs_diff(depth[rear][0]) <= 1);
+    }
+
+    #[test]
+    fn continuous_cut_casts_a_gap_at_its_self_crossing() {
+        let path = |lift| format!("G0 X12 Y20 Z0\nG1 X28 F100\nY14 Z{lift}\nX20\nY26\nM30");
+        let mut camera = Camera::default();
+        camera.center = [20., 20., 0.];
+        camera.scale = 0.25;
+        let blue = |pixels: &[[u8; 4]], column: usize, row: usize| {
+            let pixel = pixels[row * 96 + column];
+            pixel[2].saturating_sub(pixel[0])
+        };
+        for (view, rear, front) in [
+            ("top", [(46, 47), (46, 48)], [(47, 46), (48, 46)]),
+            ("bottom", [(47, 46), (48, 46)], [(46, 47), (46, 48)]),
+        ] {
+            camera.view(view);
+            let flat = depth_fixture(&path(9), &camera, false, false, "self-cross");
+            let depth = depth_fixture(&path(9), &camera, false, true, "self-cross");
+            for (near, retained) in [(rear, false), (front, true)] {
+                let before = near.iter().map(|&(x, y)| blue(&flat, x, y)).max().unwrap();
+                let after = near.iter().map(|&(x, y)| blue(&depth, x, y)).max().unwrap();
+                assert!(before > 90);
+                if retained {
+                    assert_eq!(before, after, "foreground in {view}");
+                } else {
+                    assert!(after < 20, "rear gap in {view}: {before} -> {after}");
+                }
+            }
+            let touching = depth_fixture(&path(0), &camera, false, true, "self-touch");
+            assert!(rear.iter().any(|&(x, y)| blue(&touching, x, y) > 90));
+        }
+    }
+
+    #[test]
+    fn a_cutter_sweep_can_pass_in_front_of_its_earlier_cut() {
+        let source = "G0 X20 Y20\nG1 X40 F100\nY15 Z8\nX30\nY25\nM30";
+        let mut camera = Camera::default();
+        camera.view("top");
+        camera.center = [30., 20., 4.];
+        camera.scale = 0.25;
+        let depth = depth_fixture(source, &camera, true, true, "self-sweep");
+        let red = |x: usize| (47_usize..49).map(|y| depth[y * 96 + x][0]).min().unwrap();
+        assert!(
+            red(44) > red(34) + 50,
+            "near sweep should mute the earlier cut"
+        );
+        assert!(
+            red(44) < 170,
+            "the earlier cut should stay visible through it"
+        );
     }
 
     #[test]

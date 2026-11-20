@@ -118,7 +118,8 @@ impl Camera {
         extent: f64,
         show_rapid: bool,
         dpi: f64,
-    ) -> [f32; 20] {
+        cutter_diameter: f64,
+    ) -> [f32; 24] {
         let (r, u) = self.basis();
         // Depth is relative to the vertex buffer's origin, so panning cannot clip the path.
         let axis = self.depth_axis();
@@ -152,7 +153,11 @@ impl Camera {
             (r[2] * depth_gradient) as f32,
             (u[2] * depth_gradient) as f32,
             (1. / dpi) as f32,
-            if xy_visible { 1. } else { 0. },
+            0.,
+            (0.25 * self.scale / extent) as f32,
+            (0.25 * cutter_diameter / extent) as f32,
+            (0.25 / extent) as f32,
+            0.,
         ]
     }
 }
