@@ -30,7 +30,7 @@ To read the complete agent guide, run this from Command Prompt in the download f
 CNC-Viewer-windows-x64.exe --help agents
 ```
 
-After an unexpected exit, restored tabs open with plotting paused. Use `--no-restore` to start with a blank tab and keep the saved session for later.
+After an unexpected exit, restored tabs open with plotting paused. Press Ctrl+Enter to plot the active tab. Use `--no-restore` to start with a blank tab and keep the saved session for later.
 
 Contributions are welcome, especially for items in [Next work](#next-work). [Icon artwork credits](crates/cnc-app/assets/NOTICE.md).
 

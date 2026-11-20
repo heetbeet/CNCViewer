@@ -283,9 +283,6 @@ impl Window {
                     published: Some(published),
                 });
                 pane.viewer.install_project(project);
-                if interrupted {
-                    pane.viewer.status = "Tabs recovered. Press Plot to resume.".into();
-                }
                 pane.reveal = true;
             }
         }
@@ -625,7 +622,7 @@ fn restore_projects(candidates: &[OpenTab], pause_plots: bool) -> Vec<(Project, 
         let path = session::canonical(&tab.path);
         if !seen.contains(&path) {
             if let Ok(mut project) = Project::restore(tab) {
-                project.plot_cleared = pause_plots;
+                project.plot_paused = pause_plots;
                 seen.insert(path);
                 restored.push((project, tab.clone()));
                 if restored.len() == session::RESTORE_LIMIT {
@@ -1005,7 +1002,7 @@ mod tests {
         let (reopened, candidates, interrupted) = Session::start(root.clone(), true).unwrap();
         assert!(!interrupted);
         let restored = restore_projects(&candidates, interrupted);
-        assert!(restored.iter().all(|(project, _)| !project.plot_cleared));
+        assert!(restored.iter().all(|(project, _)| !project.plot_paused));
         let ids = restored
             .iter()
             .map(|(_, record)| record.id.as_str())
@@ -1022,7 +1019,7 @@ mod tests {
         let restored = restore_projects(&candidates, interrupted);
         assert!(interrupted);
         assert_eq!(restored.len(), 7);
-        assert!(restored.iter().all(|(project, _)| project.plot_cleared));
+        assert!(restored.iter().all(|(project, _)| project.plot_paused));
         drop(recovered);
         let (clean, candidates, interrupted) = Session::start(root.clone(), false).unwrap();
         assert!(!interrupted);

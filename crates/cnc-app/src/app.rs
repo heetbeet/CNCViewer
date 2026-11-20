@@ -159,12 +159,11 @@ pub struct App {
     opened_at: u64,
     edited_at: u64,
     resume_plot: Option<project::PlotPosition>,
-    plot_cleared: bool,
+    plot_paused: bool,
     settings_dirty: bool,
     capture_path: Option<PathBuf>,
     capture_frame: usize,
     popup: u8,
-    editor_options: bool,
     fullscreen: bool,
     canvas_size: Vec2,
     scroll_line: Option<usize>,
@@ -304,12 +303,11 @@ impl App {
             opened_at: session::now(),
             edited_at: 0,
             resume_plot: None,
-            plot_cleared: false,
+            plot_paused: false,
             settings_dirty: false,
             capture_path,
             capture_frame: 0,
             popup,
-            editor_options: false,
             fullscreen: false,
             canvas_size: Vec2::new(1280., 800. - view::TOOLBAR_HEIGHT),
             scroll_line: None,
@@ -333,7 +331,7 @@ impl App {
         self.busy = false;
     }
     fn request_plot(&mut self, fit: bool) {
-        self.plot_cleared = false;
+        self.plot_paused = false;
         self.cancel_plot();
         self.diagnostics.clear();
         self.edit_deadline = None;
@@ -544,30 +542,6 @@ impl App {
             }
         }
         self.running = false;
-    }
-    fn clear_plot(&mut self, status: &str) {
-        self.plot_cleared = true;
-        self.resume_plot = None;
-        self.cancel_plot();
-        self.edit_deadline = None;
-        self.preview_stale = false;
-        if !self.model.executions.is_empty()
-            || !self.model.segments.is_empty()
-            || !self.model.diagnostics.is_empty()
-            || !self.model.warnings.is_empty()
-        {
-            self.model = Arc::new(Model::default());
-            let _ = self.plot.load(&self.model);
-        }
-        self.step = 0;
-        self.time = 0.;
-        self.selected_line = 0;
-        self.scroll_line = None;
-        self.last_stop = None;
-        self.running = false;
-        self.busy = false;
-        self.diagnostics.clear();
-        self.status = status.to_owned();
     }
     fn play(&mut self, forward: bool) {
         if self.model.executions.is_empty() || self.preview_stale {
@@ -2266,5 +2240,18 @@ mod tests {
         frame(&mut app, vec![egui::Event::Text("(edited)".into())]);
         assert!(!app.running);
         assert!(app.documents[name].contains("(edited)"));
+
+        let mut recovered = project::Project::new(
+            "recovered".into(),
+            "recovered.nc",
+            "G0 X0\nG1 X10 F100\nM30\n",
+        );
+        recovered.plot_paused = true;
+        app.install_project(recovered);
+        assert!(!app.busy && app.model.moves.is_empty());
+        assert!(app.status.contains("Ctrl+Enter"));
+        frame(&mut app, command_key(Key::Enter));
+        finish_plot(&mut app);
+        assert_eq!(app.model.moves.last().unwrap().end, [10., 0., 0.]);
     }
 }

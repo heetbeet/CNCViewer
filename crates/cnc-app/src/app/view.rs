@@ -65,7 +65,7 @@ const INK: Color32 = Color32::from_rgb(85, 85, 85);
 const TOOL_INK: Color32 = Color32::from_gray(51);
 const MINT: Color32 = Color32::from_rgb(143, 200, 160);
 const BANNER_GREEN: Color32 = Color32::from_rgb(104, 182, 136);
-const PLOT_COLORS: ([u8; 3], [u8; 3]) = ([86, 156, 110], [124, 190, 146]);
+const GREEN_ACTION_COLORS: ([u8; 3], [u8; 3]) = ([86, 156, 110], [124, 190, 146]);
 const GRAY_ACTION_COLORS: ([u8; 3], [u8; 3]) = ([55, 58, 60], [127, 130, 139]);
 const DISABLED_ACTION_TEXT: Color32 = Color32::from_gray(125);
 const SYNC_WIDTHS: [f32; 3] = [67., 82., 70.];
@@ -121,7 +121,6 @@ enum Icon {
     Flask,
     Sliders,
     Expand(bool),
-    Clear,
     Down,
     Up,
     Play(bool),
@@ -196,7 +195,6 @@ fn icon(ui: &egui::Ui, rect: Rect, icon: Icon, color: Color32) {
         Icon::Sliders => (13, 21.),
         Icon::Expand(false) => (14, 19.),
         Icon::Expand(true) => (15, 19.),
-        Icon::Clear => (16, 17.),
         Icon::Play(_) => (18, 18.),
         Icon::Pause => (19, 17.),
         Icon::Stop => (20, 17.),
@@ -299,7 +297,7 @@ fn green_action(
     paint_action(
         ui,
         rect,
-        PLOT_COLORS,
+        GREEN_ACTION_COLORS,
         enabled,
         response.hovered() || response.has_focus(),
     );
@@ -436,34 +434,6 @@ impl App {
             INK,
         );
         self.playback(ui, plot, left);
-        if self.editor_options {
-            let mut open_find = false;
-            egui::Window::new("Editor options")
-                .id(self.local_id("editor-options-window"))
-                .open(&mut self.editor_options)
-                .collapsible(false)
-                .resizable(false)
-                .show(ui.ctx(), |ui| {
-                    ui.add(
-                        egui::Slider::new(&mut self.settings.font_size, 9. ..=24.)
-                            .text("Font size"),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label("Theme");
-                        egui::ComboBox::from_id_salt("editor-theme")
-                            .selected_text(if self.settings.dark { "Dark" } else { "Light" })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.settings.dark, false, "Light");
-                                ui.selectable_value(&mut self.settings.dark, true, "Dark");
-                            });
-                    });
-                    open_find = ui.button("Find / replace").clicked();
-                });
-            if open_find {
-                self.open_find(ui.ctx(), false);
-                self.editor_options = false;
-            }
-        }
     }
     fn header(&mut self, ui: &mut egui::Ui, full: Rect, tabs: Option<&mut tabs::Strip<'_>>) {
         let y = full.min.y;
@@ -680,6 +650,16 @@ impl App {
                 self.save(true);
                 ui.close();
             }
+            if ui.button("Find / replace").clicked() {
+                self.open_find(ui.ctx(), false);
+                ui.close();
+            }
+            ui.menu_button("Editor appearance", |ui| {
+                ui.add(
+                    egui::Slider::new(&mut self.settings.font_size, 9. ..=24.).text("Font size"),
+                );
+                ui.checkbox(&mut self.settings.dark, "Dark theme");
+            });
         });
         if let Some(area) = sync {
             self.disk_conflict(ui, area);
@@ -1294,51 +1274,6 @@ impl App {
         });
         if changed {
             self.edited(ui.ctx());
-        }
-        let y = code.max.y - 35.;
-        let x = (code.max.x - 146.).max(code.min.x);
-        let plot = Rect::from_min_size(Pos2::new(x, y), Vec2::new(54., 30.));
-        if green_action(ui, plot, ui.scope_id().with("plot"), "PLOT", true)
-            .on_hover_text("Plot · Ctrl+Enter")
-            .clicked()
-        {
-            self.replot();
-        }
-        let clear = Rect::from_min_size(Pos2::new(x + 62., y), Vec2::new(34., 30.));
-        paint_action(
-            ui,
-            clear,
-            ([229, 57, 53], [239, 83, 80]),
-            true,
-            ui.rect_contains_pointer(clear),
-        );
-        if button(
-            ui,
-            clear,
-            "clear-plot",
-            Icon::Clear,
-            Color32::WHITE,
-            "Clear toolpath",
-        ) {
-            self.clear_plot("");
-        }
-        let options = clear.translate(Vec2::new(42., 0.));
-        paint_action(
-            ui,
-            options,
-            GRAY_ACTION_COLORS,
-            true,
-            ui.rect_contains_pointer(options),
-        );
-        if button(
-            ui,
-            options,
-            "editor-options",
-            Icon::Gear,
-            Color32::WHITE,
-            "Editor options",
-        ) {
-            self.editor_options = !self.editor_options;
         }
         let divider = [vars.min, Pos2::new(vars.min.x, vars.max.y)];
         let mut color = Color32::from_gray(221);

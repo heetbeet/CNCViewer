@@ -21,7 +21,8 @@ pub(super) struct Project {
     camera: Camera,
     resume: Option<PlotPosition>,
     settings: Option<Settings>,
-    pub(super) plot_cleared: bool,
+    #[serde(rename = "plot_cleared")]
+    pub(super) plot_paused: bool,
     find: find::Find,
 }
 
@@ -51,7 +52,7 @@ impl Project {
             camera: Camera::default(),
             resume: None,
             settings: None,
-            plot_cleared: false,
+            plot_paused: false,
             find: find::Find::default(),
         }
     }
@@ -144,7 +145,7 @@ impl App {
             camera: self.camera.clone(),
             resume: self.project_position(),
             settings: Some(self.settings.clone()),
-            plot_cleared: self.plot_cleared,
+            plot_paused: self.plot_paused,
             find: self.find.clone(),
         }
     }
@@ -177,7 +178,7 @@ impl App {
             camera: self.camera.clone(),
             resume: self.project_position(),
             settings: Some(self.settings.clone()),
-            plot_cleared: self.plot_cleared,
+            plot_paused: self.plot_paused,
             find: std::mem::take(&mut self.find),
         }
     }
@@ -213,9 +214,9 @@ impl App {
         self.model = Arc::default();
         let _ = self.plot.load(&self.model);
         self.preview_stale = false;
-        self.plot_cleared = project.plot_cleared;
-        if self.plot_cleared {
-            self.status = "Plot cleared".into();
+        self.plot_paused = project.plot_paused;
+        if self.plot_paused {
+            self.status = "Plot paused. Press Ctrl+Enter to plot.".into();
             self.diagnostics.clear();
         } else {
             self.request_plot(self.resume_plot.is_none());
