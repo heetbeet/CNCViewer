@@ -2,7 +2,9 @@
 
 # CNC Viewer
 
-[NC Viewer](https://ncviewer.com/) from [Toolpath Labs, Inc.](https://toolpath.com/) is the inspiration for the 3D backplot, syntax highlighting, icon style, colours, and general layout. I built this Windows desktop app in Rust for my [MachPro](https://www.mach-labs.com/product/machpro/) router and to give AI agents a way to verify the G-code they write.
+[NC Viewer](https://ncviewer.com/) from [Toolpath Labs, Inc.](https://toolpath.com/) is the inspiration for the 3D backplot, syntax highlighting, icon style, colours, and general layout.
+
+I built CNC Viewer in Rust for Windows with GPT-6.2 Astra and Sol. It supports the [MachPro](https://www.mach-labs.com/product/machpro/) G-code dialect my router uses. I can inspect and validate programs on the desktop, and my AI agents can use the CLI to check the G-code they generate.
 
 ## Features
 
@@ -22,10 +24,10 @@
 
 Download `CNC-Viewer-windows-x64.exe` from [Releases](https://github.com/heetbeet/CNCViewer/releases), or build locally with `./tools/build.ps1` using Rust MSVC and the Windows SDK.
 
-The executable includes the complete agent guide.
+To read the complete agent guide, run this from Command Prompt in the download folder.
 
-```powershell
-& './CNC-Viewer-windows-x64.exe' --help agents | Out-String
+```cmd
+CNC-Viewer-windows-x64.exe --help agents
 ```
 
 Contributions are welcome, especially for items in [Next work](#next-work). [Icon artwork credits](crates/cnc-app/assets/NOTICE.md).
