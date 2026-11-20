@@ -7,6 +7,7 @@ use cnc_core::{
     analysis::{point, sweeps},
     engine::{Model, Segment},
     geometry::Point,
+    motion::Selection,
 };
 use serde_json::{json, Value};
 use std::{borrow::Cow, fmt::Write, path::Path};
@@ -63,6 +64,7 @@ pub fn capture(
     plot: &mut Plot,
     model: &Model,
     job: &Value,
+    operations: &Value,
     view: &Value,
     finding: Option<&Value>,
     path: &Path,
@@ -134,6 +136,7 @@ pub fn capture(
     if count > 0 && from > to {
         return Err("View step range is reversed".into());
     }
+    let selection = Selection::resolve(model, operations, &view["select"])?;
     let cutter = if view["cutter"] == false {
         Cow::Owned(Value::Null)
     } else if view["cutter"].is_object() {
@@ -165,9 +168,9 @@ pub fn capture(
     };
     let mut filtered = Model::default();
     filtered.segments.extend(
-        model
-            .segments
-            .iter()
+        selection
+            .segments(model)
+            .map(|(_, segment)| segment)
             .filter(|segment| {
                 (from..=to).contains(&segment.step)
                     && region.is_none_or(|region| intersects(segment, region, padding))
@@ -233,6 +236,7 @@ pub fn capture(
         .and_then(|point| finding.map(|finding| json!([{"id":finding["id"],"point":point}])));
     let labels = annotations::labels(
         model,
+        &selection,
         if view["labels"].is_null() {
             default_label.as_ref().unwrap_or(&Value::Null)
         } else {
@@ -246,7 +250,8 @@ pub fn capture(
     Ok(json!({
         "schema":"cnc-evidence/1", "image":path, "step": if to==0 {None} else {Some(to)},
         "fromStep":from,"toStep":to,"segments":filtered.segments.len(),
-        "scope":if from==1 && to==count && model.status=="complete" {"full"} else {"prefix or range"},
+        "scope":if view["select"].is_null() && from==1 && to==count && model.status=="complete" {"full"} else {"prefix or range"},
+        "select":view["select"],
         "region":region.map(|(min,max)|json!({"min":min,"max":max})),
         "labels":labels,"camera":{"angle":angle,"direction":camera.orbit_direction(),"center":camera.center,
             "millimetersPerPixel":camera.scale,"width":width,"height":height}
@@ -256,6 +261,11 @@ pub fn capture(
 pub fn section_svg(stock: &Value, section: &Value) -> Result<String> {
     let (min, max) = bounds(&stock["bounds"])?.ok_or("Stock section needs bounds")?;
     let axis = if section["axis"] == "x" { 1 } else { 0 };
+    let [left, right] = if section["range"].is_null() {
+        [min[axis], max[axis]]
+    } else {
+        serde_json::from_value::<[f64; 2]>(section["range"].clone())?
+    };
     let mut line = String::new();
     for sample in section["points"]
         .as_array()
@@ -265,7 +275,7 @@ pub fn section_svg(stock: &Value, section: &Value) -> Result<String> {
             .as_f64()
             .ok_or("Invalid section coordinate")?;
         let height = sample["height"].as_f64().ok_or("Invalid section height")?;
-        let x = 50. + (coordinate - min[axis]) / (max[axis] - min[axis]) * 900.;
+        let x = 50. + (coordinate - left) / (right - left) * 900.;
         let y = 250. - (height - min[2]) / (max[2] - min[2]) * 210.;
         write!(line, "{x:.3},{y:.3} ")?;
     }
@@ -273,8 +283,6 @@ pub fn section_svg(stock: &Value, section: &Value) -> Result<String> {
         .as_f64()
         .ok_or("Invalid section plane")?;
     let name = if axis == 1 { "X" } else { "Y" };
-    let left = min[axis];
-    let right = max[axis];
     let top = max[2];
     let bottom = min[2];
     Ok(format!(

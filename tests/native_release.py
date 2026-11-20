@@ -66,6 +66,65 @@ with tempfile.TemporaryDirectory(prefix='CNC native release ') as temporary:
     assert image[:8] == b'\x89PNG\r\n\x1a\n'
     assert struct.unpack('>II', image[16:24]) == (512, 384)
     assert json.loads((root / 'evidence/top.json').read_text())['labels'][0]['point'] == [8, 0, -1]
+    op = {'id': 'second', 'from': {'line': 2, 'visit': 2}, 'to': {'line': 5, 'visit': 2}}
+    selected = {'operation': 'second'}
+    visit = {'source': source.name, 'fromLine': 4, 'toLine': 4, 'visit': 2}
+    report = run({'setup': setup, 'output': 'selected', 'operations': [op],
+                  'motion': [{'id': 'op', 'select': selected}, {'id': 'visit', 'select': visit}],
+                  'artifacts': {'movements': {'select': selected, 'format': 'jsonl'}},
+                  'views': [{'name': 'visit', 'select': visit, 'labels': True, 'width': 128, 'height': 128}]})
+    assert report['execution']['scope'] == 'full' and report['summary']['moves'] == 12
+    assert report['motion'][0]['moves'] == 4 and report['motion'][1]['moves'] == 1
+    assert report['motion'][1]['bounds'] == {'min': [10, 0, -1], 'max': [18, 0, -1]}
+    assert report['artifacts']['movements']['records'] == 4
+    selected_moves = [json.loads(line) for line in
+                      (root / 'selected' / report['artifacts']['movements']['file']).read_text().splitlines()]
+    assert selected_moves == movements[4:8]
+    assert selected_moves[2]['visit'] == 2
+    selected_view = json.loads((root / 'selected/visit.json').read_text())
+    assert selected_view['segments'] == 1
+    assert [label['point'] for label in selected_view['labels']] == [[18, 0, -1]]
+
+    repeated = root / 'repeat.nc'
+    repeated.write_text('G21 G90\nM98 P9000\nG0 Y4\nM98 P9000\nM30\n')
+    sub = root / 'repeat_sub.nc'
+    sub.write_text('O9000\nG91\nG1 X2 F120\nG90\nM99\n')
+    sub_visit = {'source': sub.name, 'fromLine': 3, 'toLine': 3, 'visit': 2}
+    report = run({'output': 'repeat', 'libraries': [sub.name],
+                  'motion': [{'id': 'second', 'select': sub_visit}],
+                  'artifacts': {'movements': {'select': sub_visit, 'format': 'jsonl'}}},
+                 program=repeated)
+    assert report['motion'][0]['bounds'] == {'min': [2, 4, 0], 'max': [4, 4, 0]}
+    records = (root / 'repeat/movements.jsonl').read_text().splitlines()
+    assert len(records) == 1 and json.loads(records[0])['visit'] == 2
+
+    ramp = root / 'ramp.nc'
+    ramp.write_text('G0 Z5\nG1 X10 Z-5 F100\nY4\nX8\nM30\n')
+    polygon = [[6, 1], [9, 1], [9, 6], [7, 6], [7, 3], [6, 3]]
+    band = {'id': 'band', 'polygon': polygon, 'z': [-3, -1],
+            'select': {'fromLine': 2, 'toLine': 2}}
+    report = run({'cutter': {'diameter': 4}, 'clearance': [
+        band, dict(band, id='protected', z=[-5, -1], select=None, minimumClearance=0),
+        dict(band, id='outside-band', z=[6, 8]),
+    ]}, 2, ramp)
+    measured, protected, empty = report['clearance']
+    assert measured['status'] == 'measured' and measured['minimumClearance'] == -1
+    assert measured['closest']['point'] == [6, 0, -1] and measured['closest']['regionPoint'] == [6, 1]
+    assert protected['minimumClearance'] == -2 and protected['closest']['line'] == 4
+    assert protected['firstViolation']['line'] == 2 and report['firstFailure']['check'] == 'cutterClearance'
+    assert empty['status'] == 'empty' and empty['minimumClearance'] is None
+    report = run({'cutter': {'diameter': 4}, 'clearance': [band],
+                  'limits': {'clearanceTests': 1}}, 2, ramp)
+    assert report['validation'] == 'incomplete' and not report['clearance'][0]['complete']
+    assert report['firstFailure']['check'] == 'clearanceIncomplete'
+    report = run({'clearance': [band]}, 2, ramp)
+    assert 'diameter' in report['clearance'][0]['reason']
+    report = run({'cutter': {'diameter': 4}, 'clearance': [
+        dict(band, select={'fromLine': 99, 'toLine': 99}, minimumClearance=0)]}, 2, ramp)
+    assert report['clearance'][0]['reason'] == 'Selection contains no executed feed segments'
+    report = run({'cutter': {'diameter': 4}, 'clearance': [
+        dict(band, polygon=[[0, 0], [2, 2], [0, 2], [2, 0]])]}, 1, ramp)
+    assert 'polygon' in report['error']['message']
     report = run({'setup': setup, 'output': 'bad-view', 'views': [{'name': 'bad', 'step': 999999}]}, 2)
     assert report['status'] == 'complete' and report['summary']['moves'] == 12
     assert report['validation'] == 'incomplete' and report['artifactError']
@@ -127,12 +186,16 @@ with tempfile.TemporaryDirectory(prefix='CNC native release ') as temporary:
     assert (linked / 'top.png').read_bytes().startswith(b'\x89PNG')
     report = run({'setup': setup, 'cutter': {'diameter': 2}, 'output': 'stock',
                   'stock': {'bounds': {'min': [0, -2, -2], 'max': [30, 2, 0]},
-                            'sections': [{'id': 'section', 'axis': 'y', 'at': 0}]},
+                            'sections': [{'id': 'section', 'axis': 'y', 'at': 0},
+                                         {'id': 'short', 'axis': 'y', 'at': 0, 'range': [5, 8]}]},
                   'artifacts': {'sections': True, 'stock': True}})
     assert '<polyline' in (root / 'stock/section.svg').read_text()
     assert report['stock']['complete'] is True
     assert 'heights' not in report['stock']
     assert len(json.loads((root / 'stock/stock.json').read_text())['heights']) == 120
+    section = json.loads((root / 'stock/short.json').read_text())
+    assert section['sampleSpacing'] == 1 and section['sampledAt'] == 0.5
+    assert [point['coordinate'] for point in section['points']] == [5.5, 6.5, 7.5]
     report = run({'setup': setup, 'cutter': {'diameter': 2}, 'output': 'stock-target',
                   'stock': {'bounds': {'min': [0, -2, -2], 'max': [30, 2, 0]},
                             'target': {'z': -1}}}, 2)
@@ -157,6 +220,7 @@ with tempfile.TemporaryDirectory(prefix='CNC native release ') as temporary:
     spec.loader.exec_module(helper)
     assert helper.inspect(source, {'setup': setup})['validation'] == 'passed'
     assert len(helper.movements(source, setup)) == 12
+    assert list(helper.iter_movements(source, setup, select=visit)) == [movements[6]]
     assert helper.inspect_text('G0 X0\nG1 X3 F20\nM30')['summary']['end'] == [3, 0, 0]
     state = helper.state(source, {'line': 4, 'visit': 2}, setup)
     assert state['position'] == [18, 0, -1] and state['variables']['101'] == 1

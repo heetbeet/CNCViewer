@@ -1,3 +1,3 @@
 interface:
   display_name: "CNC Viewer"
-  short_description: "Validate cuts, inspect stock and export offline evidence"
+  short_description: "Select motion, measure cutter clearance and inspect stock"

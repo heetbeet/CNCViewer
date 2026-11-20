@@ -16,7 +16,11 @@ def executable():
     if hint.is_file():
         return Path(hint.read_text(encoding='utf-8').strip())
     root = skill.parents[1]
-    for path in [root / 'output/desktop/CNC Viewer.exe', root / 'target/release/cnc-viewer.exe']:
+    for path in [
+        root / 'output/desktop/CNC Viewer.exe',
+        root / 'target/x86_64-pc-windows-msvc/release/cnc-viewer.exe',
+        root / 'target/release/cnc-viewer.exe',
+    ]:
         if path.is_file():
             return path
     raise FileNotFoundError('Build CNC Viewer with tools/build.ps1 or set CNC_VIEWER_EXE')
@@ -56,18 +60,27 @@ def _inspect(path, job, text=None):
         return json.loads(process.stdout)
 
 
-def movements(path, setup=None, *, until=None, libraries=(), feed_only=False):
-    """Extract executed moves with source locations and arc vertices."""
+def movements(path, setup=None, *, select=None, operations=(), until=None, libraries=(), feed_only=False):
+    """Return selected movements as a list. Use iter_movements for long selections."""
+    return list(iter_movements(path, setup, select=select, operations=operations,
+                               until=until, libraries=libraries, feed_only=feed_only))
+
+
+def iter_movements(path, setup=None, *, select=None, operations=(), until=None, libraries=(), feed_only=False):
+    """Yield selected moves with source visits and sampled motion vertices."""
     with tempfile.TemporaryDirectory(prefix='cnc-moves-') as temporary:
         report = inspect(path, {
             'setup': setup or {}, 'output': temporary, 'until': until,
-            'libraries': list(libraries), 'artifacts': {'movements': True},
+            'libraries': list(libraries), 'operations': list(operations),
+            'artifacts': {'movements': {'format': 'jsonl', 'select': select, 'feedOnly': feed_only}},
         })
         status = 'paused' if until is not None else 'complete'
         if report['status'] != status or report.get('artifactError'):
             raise RuntimeError(json.dumps(report))
-        records = json.loads((Path(temporary) / 'movements.json').read_text(encoding='utf-8'))
-        return [record for record in records if not record['rapid']] if feed_only else records
+        artifact = report['artifacts']['movements']
+        with (Path(report['artifacts']['directory']) / artifact['file']).open(encoding='utf-8') as records:
+            for line in records:
+                yield json.loads(line)
 
 
 def state(path, selector, setup=None, *, libraries=()):

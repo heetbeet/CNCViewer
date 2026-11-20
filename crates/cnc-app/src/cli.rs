@@ -1,13 +1,14 @@
 use cnc_core::{
     analysis, compiler,
     engine::{self, Options},
+    motion,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{self, Read, Write},
+    io::{self, BufWriter, Read, Write},
     path::Path,
     time::Instant,
 };
@@ -214,18 +215,39 @@ fn artifact_directory(
     }
     Ok(output)
 }
-fn movement_records(model: &engine::Model) -> Result<Vec<Value>> {
-    model
-        .moves
-        .iter()
-        .enumerate()
-        .map(|(index, movement)| {
+fn export_movements(
+    output: &Path,
+    model: &engine::Model,
+    operations: &Value,
+    request: &Value,
+) -> Result<Value> {
+    let selection = motion::Selection::resolve(model, operations, &request["select"])?;
+    let jsonl = request["format"] == "jsonl";
+    let feed_only = request["feedOnly"] == true;
+    let name = if jsonl {
+        "movements.jsonl"
+    } else {
+        "movements.json"
+    };
+    let last = selection.bounds().map_or(0, |(_, last)| last);
+    let visits: Vec<_> = motion::visits(model).take(last).collect();
+    let mut written = 0;
+    write_artifact(&output.join(name), |file| {
+        let mut writer = BufWriter::new(file);
+        if !jsonl {
+            writer.write_all(b"[")?;
+        }
+        for (index, movement) in selection
+            .moves(model)
+            .filter(|(_, movement)| !feed_only || !movement.rapid)
+        {
             let state = model.executions.get(movement.step.saturating_sub(1));
             let mut record = serde_json::to_value(movement)?;
             record["id"] = json!(index + 1);
             record["source"] = json!(state.map(|state| &state.source));
             record["program"] = json!(state.and_then(|state| state.program));
             record["sequence"] = json!(state.and_then(|state| state.sequence));
+            record["visit"] = json!(visits.get(movement.step.saturating_sub(1)));
             let segments = &model.segments[movement.segment_start..movement.segment_end];
             let mut vertices = Vec::with_capacity(segments.len() + 1);
             vertices.push(movement.start);
@@ -235,9 +257,22 @@ fn movement_records(model: &engine::Model) -> Result<Vec<Value>> {
                 vertices.extend(segments.iter().map(|s| s.end));
             }
             record["vertices"] = json!(vertices);
-            Ok(record)
-        })
-        .collect()
+            if !jsonl && written > 0 {
+                writer.write_all(b",")?;
+            }
+            serde_json::to_writer(&mut writer, &record)?;
+            if jsonl {
+                writer.write_all(b"\n")?;
+            }
+            written += 1;
+        }
+        if !jsonl {
+            writer.write_all(b"]")?;
+        }
+        writer.flush()?;
+        Ok(())
+    })?;
+    Ok(json!({"file":name,"records":written,"format":if jsonl { "jsonl" } else { "json" }}))
 }
 pub fn inspect(file: &str, config: Option<&str>) -> Result<(Value, i32)> {
     let started = Instant::now();
@@ -337,6 +372,19 @@ pub fn inspect(file: &str, config: Option<&str>) -> Result<(Value, i32)> {
         if let Some(artifacts) = job["artifacts"].as_object() {
             for (key, value) in artifacts {
                 match key.as_str() {
+                    "movements" if value.is_object() => {
+                        if value
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                            .any(|k| !["select", "format", "feedOnly"].contains(&k.as_str()))
+                            || !(value["format"].is_null()
+                                || matches!(value["format"].as_str(), Some("json" | "jsonl")))
+                            || !(value["feedOnly"].is_null() || value["feedOnly"].is_boolean())
+                        {
+                            return Err("artifacts.movements accepts select, format (json or jsonl), and boolean feedOnly".into());
+                        }
+                    }
                     "movements" | "footprints" | "stock" | "sections" => {
                         if !value.is_null() && !value.is_boolean() {
                             return Err(format!("artifacts.{key} must be boolean").into());
@@ -459,11 +507,13 @@ pub fn inspect(file: &str, config: Option<&str>) -> Result<(Value, i32)> {
             };
             report["artifacts"] = json!({"directory":output});
             let artifact_result = (|| -> Result<()> {
-                if artifacts["movements"] == true {
-                    write(
-                        &output.join("movements.json"),
-                        &serde_json::to_vec(&movement_records(&model)?)?,
-                    )?
+                if artifacts["movements"] == true || artifacts["movements"].is_object() {
+                    report["artifacts"]["movements"] = export_movements(
+                        &output,
+                        &model,
+                        &report["operations"],
+                        &artifacts["movements"],
+                    )?;
                 }
                 if artifacts["footprints"] == true {
                     let sweeps = analysis::sweeps(&model, &job)?;
@@ -580,8 +630,15 @@ pub fn inspect(file: &str, config: Option<&str>) -> Result<(Value, i32)> {
                         }
                         let path = output.join(format!("{name}.png"));
                         let plot = gpu.as_mut().ok_or("Renderer unavailable")?;
-                        let mut evidence =
-                            crate::evidence::capture(plot, &model, &job, view, finding, &path)?;
+                        let mut evidence = crate::evidence::capture(
+                            plot,
+                            &model,
+                            &job,
+                            &report["operations"],
+                            view,
+                            finding,
+                            &path,
+                        )?;
                         evidence["caseId"] = json!(id);
                         evidence["identity"] = report["identity"].clone();
                         evidence["coordinateFrame"] = report["coordinateFrame"].clone();

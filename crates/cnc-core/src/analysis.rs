@@ -1,7 +1,9 @@
+mod clearance;
+
 use crate::{
-    engine::{Model, State, Target},
+    engine::{Model, Segment, State, Target},
     error::{NcError, Result},
-    overlap,
+    motion, overlap,
     stock::{sample, Sweep},
 };
 use serde_json::{json, Value};
@@ -287,6 +289,34 @@ pub fn validate(model: &Model, job: &Value) -> Result<Value> {
     let passed = (complete || intentional) && first_failure.is_none();
     let mut report = json!({"schema":"cnc-inspection/2","units":"mm","coordinateFrame":"machine tool-tip XYZ","profile":{"interpreter":"machpro-2026.7.14.2"},"status":model.status,"validation":if !(complete||intentional){"incomplete"}else if passed{"passed"}else{"failed"},"execution":{"complete":complete,"intentionalPause":intentional,"scope":if complete{"full"}else{"prefix"}},"summary":{"steps":model.executions.len(),"moves":model.moves.len(),"segments":model.segments.len(),"bounds":model.bounds.map(|(min,max)|json!({"min":min,"max":max})),"end":model.executions.last().map(|s|s.position),"feedLength":model.moves.iter().filter(|m|!m.rapid).map(|m|m.length).sum::<f64>(),"rapidLength":model.moves.iter().filter(|m|m.rapid).map(|m|m.length).sum::<f64>(),"seconds":model.executions.last().map_or(0.,|s|s.elapsed/1000.)},"firstFailure":first_failure,"requirements":model.requirements,"findingCount":findings.len(),"findings":findings,"checks":{"passed":passed}});
     report["operations"] = json!(operations);
+    if !job["motion"].is_null() {
+        let queries = job["motion"]
+            .as_array()
+            .ok_or_else(|| NcError::new("motion must be an array of named selections"))?;
+        let mut ids = std::collections::BTreeSet::new();
+        let summaries = queries
+            .iter()
+            .map(|query| {
+                let id = query["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty() && ids.insert(*id))
+                    .ok_or_else(|| NcError::new("Motion queries require unique nonempty IDs"))?;
+                if query
+                    .as_object()
+                    .is_none_or(|fields| fields.keys().any(|key| key != "id" && key != "select"))
+                {
+                    return Err(NcError::new("Motion queries accept id and select"));
+                }
+                let selection =
+                    motion::Selection::resolve(model, &report["operations"], &query["select"])?;
+                let mut summary = selection.summary(model);
+                summary["id"] = json!(id);
+                Ok(summary)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        report["motion"] = json!(summaries);
+    }
+    clearance::measure(model, job, &mut report)?;
     if !job["overlap"].is_null() {
         let config = &job["overlap"];
         if !config.is_object() {
@@ -387,17 +417,7 @@ fn add_finding_locations(model: &Model, report: &mut Value) {
     else {
         return;
     };
-    let mut seen = std::collections::HashMap::new();
-    let visits: Vec<_> = model
-        .executions
-        .iter()
-        .take(last_step)
-        .map(|state| {
-            let count = seen.entry((state.source.as_str(), state.line)).or_insert(0);
-            *count += 1;
-            *count
-        })
-        .collect();
+    let visits: Vec<_> = motion::visits(model).take(last_step).collect();
     for finding in &mut *findings {
         if let Some(index) = finding["step"]
             .as_u64()
@@ -463,36 +483,35 @@ pub fn sweeps(model: &Model, job: &Value) -> Result<Vec<Sweep>> {
         .iter()
         .enumerate()
         .filter(|(_, s)| !s.rapid)
-        .map(|(i, s)| {
-            if s.rotation
-                .iter()
-                .chain(&s.start_rotation)
-                .any(|v| v.abs() > 1e-9)
-            {
-                return Err(NcError::new("Cutter sweeps require a vertical tool"));
-            }
-            let tool = &cutter["tools"][s.tool.to_string()]["diameter"];
-            let default = &cutter["diameter"];
-            let diameter = if !tool.is_null() {
-                tool.as_f64()
-            } else if !default.is_null() {
-                default.as_f64()
-            } else {
-                s.tool_diameter
-            };
-            let diameter = diameter
-                .filter(|d| d.is_finite() && *d > 0. && *d <= 10000.)
-                .ok_or_else(|| {
-                    NcError::new(format!("Supply a positive diameter for tool {}", s.tool))
-                })?;
-            Ok(Sweep {
-                start: s.start,
-                end: s.end,
-                diameter,
-                witness: i,
-            })
-        })
+        .map(|(i, s)| sweep_for(s, i, cutter))
         .collect()
+}
+
+fn sweep_for(s: &Segment, i: usize, cutter: &Value) -> Result<Sweep> {
+    if s.rotation
+        .iter()
+        .chain(&s.start_rotation)
+        .any(|v| v.abs() > 1e-9)
+    {
+        return Err(NcError::new("Cutter sweeps require a vertical tool"));
+    }
+    let tool = &cutter["tools"][s.tool.to_string()]["diameter"];
+    let default = &cutter["diameter"];
+    let diameter = if !tool.is_null() {
+        tool.as_f64()
+    } else if !default.is_null() {
+        default.as_f64()
+    } else {
+        s.tool_diameter
+    }
+    .filter(|d| d.is_finite() && *d > 0. && *d <= 10000.)
+    .ok_or_else(|| NcError::new(format!("Supply a positive diameter for tool {}", s.tool)))?;
+    Ok(Sweep {
+        start: s.start,
+        end: s.end,
+        diameter,
+        witness: i,
+    })
 }
 pub fn stock(model: &Model, job: &Value) -> Result<Value> {
     stock_report(model, job, true)
@@ -560,8 +579,45 @@ pub fn stock_report(model: &Model, job: &Value, include_heights: bool) -> Result
             let count = if axis == 0 { nx } else { ny };
             let spacing = if axis == 0 { dx } else { dy };
             let slot = (((at - min[axis]) / spacing).floor() as usize).min(count - 1);
-            let points:Vec<_>=(0..if axis==0{ny}else{nx}).map(|n|{let cell=if axis==0{n*nx+slot}else{slot*nx+n};json!({"coordinate":min[1-axis]+(n as f64+0.5)*if axis==0{dy}else{dx},"height":result.heights[cell],"remaining":result.heights[cell]-min[2],"through":result.heights[cell]<=min[2],"witness":witness(cell)})}).collect();
-            sections.push(json!({"id":section["id"].as_str().map(str::to_owned).unwrap_or_else(||format!("section-{}",i+1)),"axis":section["axis"],"requestedAt":at,"sampledAt":min[axis]+(slot as f64+0.5)*spacing,"points":points}));
+            let across = 1 - axis;
+            let mut range = [min[across], max[across]];
+            if !section["range"].is_null() {
+                range = serde_json::from_value(section["range"].clone())
+                    .ok()
+                    .filter(|range: &[f64; 2]| {
+                        range[0] >= min[across] && range[1] <= max[across] && range[0] < range[1]
+                    })
+                    .ok_or_else(|| {
+                        NcError::new("Section range must be increasing and inside the stock bounds")
+                    })?;
+            }
+            let sample_spacing = if axis == 0 { dy } else { dx };
+            let points: Vec<_> = (0..if axis == 0 { ny } else { nx })
+                .filter_map(|n| {
+                    let coordinate = min[across] + (n as f64 + 0.5) * sample_spacing;
+                    if !(range[0]..=range[1]).contains(&coordinate) {
+                        return None;
+                    }
+                    let cell = if axis == 0 {
+                        n * nx + slot
+                    } else {
+                        slot * nx + n
+                    };
+                    let height = result.heights[cell];
+                    Some(
+                        json!({"coordinate":coordinate,"height":height,"remaining":height-min[2],
+                    "through":height<=min[2],"witness":witness(cell)}),
+                    )
+                })
+                .collect();
+            if points.is_empty() {
+                return Err(NcError::new(
+                    "Section range contains no sample centers. Use a wider range or a finer grid.",
+                ));
+            }
+            sections.push(json!({"id":section["id"].as_str().map(str::to_owned).unwrap_or_else(||format!("section-{}",i+1)),
+                "axis":section["axis"],"requestedAt":at,"sampledAt":min[axis]+(slot as f64+0.5)*spacing,
+                "range":range,"sampleSpacing":sample_spacing,"points":points}));
         }
     } else if !config["sections"].is_null() {
         return Err(NcError::new("Stock sections must be an array"));

@@ -6,5 +6,6 @@ pub mod error;
 pub mod geometry;
 pub mod language;
 pub mod lexer;
+pub mod motion;
 pub mod overlap;
 pub mod stock;

@@ -5,20 +5,21 @@ use serde_json::{json, Value};
 
 pub fn labels(
     model: &Model,
+    selection: &cnc_core::motion::Selection,
     request: &Value,
     from: usize,
     to: usize,
 ) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
     let requests = if request == &Value::Bool(true) {
         let mut points = Vec::new();
-        let start = model.moves.partition_point(|m| m.step < from);
-        let end = model.moves.partition_point(|m| m.step <= to);
-        let stride = (end.saturating_sub(start) / 8).max(1);
-        for movement in model.moves[start.min(end)..end]
-            .iter()
-            .step_by(stride)
-            .take(8)
-        {
+        let selected = || {
+            selection
+                .moves(model)
+                .map(|(_, movement)| movement)
+                .filter(|movement| (from..=to).contains(&movement.step))
+        };
+        let stride = (selected().count() / 8).max(1);
+        for movement in selected().step_by(stride).take(8) {
             points.push(json!({"step":movement.step}));
         }
         points
@@ -40,7 +41,7 @@ pub fn labels(
                 (analysis::point(&item["point"])?, None, None, None)
             } else {
                 let state = analysis::select_state(model, &item)?;
-                if !(from..=to).contains(&state.step) {
+                if !(from..=to).contains(&state.step) || !selection.contains(state.step) {
                     return Err("Label checkpoint is outside the displayed range".into());
                 }
                 (

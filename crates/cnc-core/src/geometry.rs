@@ -142,10 +142,12 @@ pub fn arc_points(a: &Arc) -> Result<Vec<Point>, ArcError> {
 }
 
 pub fn segment_distance_xy(a: Point, b: Point, c: Point, d: Point) -> f64 {
-    fn cross(a: Point, b: Point, c: Point) -> f64 {
-        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-    }
-    fn point_segment(p: Point, a: Point, b: Point) -> f64 {
+    segment_nearest_xy(a, b, c, d).0
+}
+
+// Distance and interpolation factors on AB and CD.
+pub(crate) fn segment_nearest_xy(a: Point, b: Point, c: Point, d: Point) -> (f64, f64, f64) {
+    fn point_segment(p: Point, a: Point, b: Point) -> (f64, f64) {
         let dx = b[0] - a[0];
         let dy = b[1] - a[1];
         let den = dx * dx + dy * dy;
@@ -155,21 +157,28 @@ pub fn segment_distance_xy(a: Point, b: Point, c: Point, d: Point) -> f64 {
             0.
         }
         .clamp(0., 1.);
-        (p[0] - a[0] - t * dx).hypot(p[1] - a[1] - t * dy)
+        ((p[0] - a[0] - t * dx).hypot(p[1] - a[1] - t * dy), t)
     }
-    let (x, y, z, w) = (
-        cross(a, b, c),
-        cross(a, b, d),
-        cross(c, d, a),
-        cross(c, d, b),
-    );
-    if ((x < 0. && y > 0.) || (x > 0. && y < 0.)) && ((z < 0. && w > 0.) || (z > 0. && w < 0.)) {
-        return 0.;
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let cd = [d[0] - c[0], d[1] - c[1]];
+    let ac = [c[0] - a[0], c[1] - a[1]];
+    let cross = |[x, y]: [f64; 2], [u, v]: [f64; 2]| x * v - y * u;
+    let denominator = cross(ab, cd);
+    if denominator != 0. {
+        let t = cross(ac, cd) / denominator;
+        let u = cross(ac, ab) / denominator;
+        if (0. ..=1.).contains(&t) && (0. ..=1.).contains(&u) {
+            return (0., t, u);
+        }
     }
-    point_segment(a, c, d)
-        .min(point_segment(b, c, d))
-        .min(point_segment(c, a, b))
-        .min(point_segment(d, a, b))
+    let (da, ua) = point_segment(a, c, d);
+    let (db, ub) = point_segment(b, c, d);
+    let (dc, tc) = point_segment(c, a, b);
+    let (dd, td) = point_segment(d, a, b);
+    [(da, 0., ua), (db, 1., ub), (dc, tc, 0.), (dd, td, 1.)]
+        .into_iter()
+        .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)))
+        .unwrap()
 }
 
 #[cfg(test)]
