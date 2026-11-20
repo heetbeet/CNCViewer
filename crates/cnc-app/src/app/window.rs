@@ -1133,17 +1133,20 @@ mod tests {
         assert_eq!(window.panes[0].tabs.len(), 2);
 
         let recent_name = "production-test-file-with-a-readable-name.nc";
-        window.history.rows = vec![Recent {
-            path: PathBuf::from(recent_name),
-            opened: chrono::NaiveDate::from_ymd_opt(2026, 11, 20)
-                .unwrap()
-                .and_hms_opt(12, 0, 0)
-                .unwrap()
-                .and_local_timezone(chrono::Local)
-                .single()
-                .unwrap()
-                .timestamp_micros() as u64,
-        }];
+        let opened = chrono::NaiveDate::from_ymd_opt(2026, 11, 20)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap()
+            .timestamp_micros() as u64;
+        window.history.rows = ["short.nc", recent_name]
+            .map(|name| Recent {
+                path: PathBuf::from(name),
+                opened,
+            })
+            .to_vec();
         frame(&mut window, vec![]);
         click(&mut window, pos2(194., 18.), PointerButton::Primary);
         frame(&mut window, vec![]);
@@ -1158,16 +1161,43 @@ mod tests {
         };
         let (date, _) = find_text("2026-11-20").unwrap();
         let (sample, _) = find_text("Sample").unwrap();
-        let (file, clip) = find_text(recent_name).unwrap();
+        let (file, _) = find_text(recent_name).unwrap();
         assert!(sample.pos.y < date.pos.y);
-        assert!(file.pos.x > date.pos.x && file.pos.x + file.galley.size().x < clip.right());
+        assert!(file.pos.x > date.pos.x);
+        let captions = Rect::from_min_size(sample.pos, sample.galley.size())
+            .union(Rect::from_min_size(file.pos, file.galley.size()));
+        let menu_right = shapes
+            .iter()
+            .flat_map(|shape| match &shape.shape {
+                egui::Shape::Vec(parts) => parts.as_slice(),
+                part => std::slice::from_ref(part),
+            })
+            .filter_map(|shape| match shape {
+                egui::Shape::Rect(frame) if frame.rect.contains_rect(captions) => {
+                    Some(frame.rect.right())
+                }
+                _ => None,
+            })
+            .reduce(f32::min)
+            .unwrap();
+        let right_padding = menu_right - captions.right();
+        assert!(
+            (5. ..=24.).contains(&right_padding),
+            "Filename padding was {right_padding}"
+        );
         assert!(!file.galley.elided);
+        assert!(shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Path(path) if path.closed && path.points.iter().all(|point| {
+                point.x >= date.pos.x && point.x < sample.pos.x
+                    && point.y >= sample.pos.y && point.y <= sample.pos.y + sample.galley.size().y
+            }))
+        }));
         let sample_position = sample.pos + sample.galley.size() / 2.;
         let recent_position = file.pos + file.galley.size() / 2.;
         window
             .history
             .missing
-            .insert(window.history.rows[0].clone());
+            .insert(window.history.rows[1].clone());
         let after = frame(&mut window, vec![]);
         let gray_file = after
             .iter()

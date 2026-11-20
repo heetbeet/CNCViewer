@@ -392,49 +392,6 @@ impl App {
             FontId::proportional(12.),
             INK,
         );
-        if !self.diagnostics.is_empty() {
-            let target = Rect::from_min_size(
-                Pos2::new(full.max.x - 109., plot.min.y + 25.),
-                Vec2::new(100., 23.),
-            );
-            let mut notes = child(ui, target, "diagnostics");
-            if notes.button("Diagnostics").clicked() {
-                self.show_diagnostics = !self.show_diagnostics;
-            }
-        }
-        if self.show_diagnostics && !self.diagnostics.is_empty() {
-            let mut location = None;
-            egui::Window::new("Diagnostics")
-                .id(self.local_id("diagnostics-window"))
-                .open(&mut self.show_diagnostics)
-                .show(ui.ctx(), |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(300.)
-                        .show(ui, |ui| {
-                            for note in &self.diagnostics {
-                                if ui
-                                    .button(format!(
-                                        "{}:{}  {}",
-                                        note.source, note.line, note.error.message
-                                    ))
-                                    .clicked()
-                                {
-                                    location = Some((note.source.clone(), note.line, note.step));
-                                }
-                            }
-                        });
-                });
-            if let Some((source, line, step)) = location {
-                if step > 0 {
-                    self.seek(step - 1);
-                }
-                self.selected = source;
-                self.selected_line = line;
-                self.scroll_line = Some(line);
-                self.settings.editor_open = true;
-                self.settings.code_open = true;
-            }
-        }
         self.playback(ui, plot, left);
         if self.editor_options {
             let mut open_find = false;

@@ -1,7 +1,10 @@
 $ErrorActionPreference = 'Stop'
+$target = 'x86_64-pc-windows-msvc'
+$targetFlags = $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS
 Push-Location (Split-Path $PSScriptRoot -Parent)
 try {
-    cargo build --locked --release -p cnc-viewer
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=+crt-static'
+    cargo build --locked --release -p cnc-viewer --target $target
     if ($LASTEXITCODE -ne 0) { throw 'Rust build failed.' }
     $desktop = (New-Item -ItemType Directory -Force 'output/desktop').FullName
     $build = (Resolve-Path -LiteralPath 'target').Path
@@ -13,7 +16,7 @@ try {
     try {
         Get-ChildItem -LiteralPath $build -Filter 'cnc-viewer-retired-*.exe' -File |
             ForEach-Object { Remove-Item -LiteralPath $_.FullName -ErrorAction SilentlyContinue }
-        Copy-Item -LiteralPath 'target/release/cnc-viewer.exe' -Destination $incoming
+        Copy-Item -LiteralPath "target/$target/release/cnc-viewer.exe" -Destination $incoming
         if (Test-Path -LiteralPath $destination) {
             # Windows can move a running executable but cannot overwrite its mapped image.
             [IO.File]::Move($destination, $retired)
@@ -34,4 +37,7 @@ try {
         $lock.Dispose()
     }
     Get-Item -LiteralPath $destination | Select-Object FullName, Length
-} finally { Pop-Location }
+} finally {
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = $targetFlags
+    Pop-Location
+}

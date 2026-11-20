@@ -150,7 +150,6 @@ pub struct App {
     edit_deadline: Option<Instant>,
     preview_stale: bool,
     diagnostics: Vec<Diagnostic>,
-    show_diagnostics: bool,
     #[cfg(windows)]
     space_mouse: crate::spacemouse::SpaceMouse,
     find: find::Find,
@@ -295,7 +294,6 @@ impl App {
             edit_deadline: None,
             preview_stale: false,
             diagnostics: Vec::new(),
-            show_diagnostics: false,
             #[cfg(windows)]
             space_mouse: Default::default(),
             find: find::Find::default(),
@@ -566,7 +564,6 @@ impl App {
         self.running = false;
         self.busy = false;
         self.diagnostics.clear();
-        self.show_diagnostics = false;
         self.status = status.to_owned();
     }
     fn play(&mut self, forward: bool) {
@@ -871,20 +868,7 @@ impl App {
                         .extend(model.diagnostics.iter().chain(&model.warnings).cloned());
                     self.diagnostics
                         .sort_by(|a, b| a.source.cmp(&b.source).then(a.line.cmp(&b.line)));
-                    self.status = format!(
-                        "{} moves · {:.0} ms{}",
-                        model.moves.len(),
-                        ms,
-                        if model.status == "complete" {
-                            String::new()
-                        } else {
-                            format!(" · stopped: {}", model.status)
-                        }
-                    );
-                    if let Some(error) = model.diagnostics.first() {
-                        self.status =
-                            format!("{}:{} {}", error.source, error.line, error.error.message)
-                    }
+                    self.status = format!("{} moves · {ms:.0} ms", model.moves.len());
                     if let Some(error) = &prepared.trail_error {
                         self.settings.show_toolbit_path = false;
                         self.status = error.clone();
@@ -934,14 +918,16 @@ impl App {
                     }
                 }
                 Err(mut error) => {
-                    self.status = error.to_string();
                     if let Some(location) = error.location.take() {
+                        self.status = "Plot stopped".into();
                         self.diagnostics.push(Diagnostic {
                             source: location.source,
                             line: location.line,
                             step: 0,
                             error,
                         });
+                    } else {
+                        self.status = error.to_string();
                     }
                 }
             }
@@ -2126,6 +2112,11 @@ mod tests {
         let message = "Arc radius R is too small to reach the endpoint";
         let annotation = format!("·  {message}");
         let shapes = frame(&mut app, vec![]);
+        assert!(shapes.iter().all(|shape| {
+            !matches!(&shape.shape, egui::Shape::Text(text)
+                if text.galley.job.text == "Diagnostics"
+                    || (text.galley.job.text.contains(message) && text.galley.job.text != annotation))
+        }));
         let row = shapes
             .iter()
             .find_map(|shape| match &shape.shape {
@@ -2194,6 +2185,7 @@ mod tests {
         );
         assert_eq!(app.diagnostics[0].source, "O9012.nc");
         assert_eq!(app.diagnostics[0].line, 3);
+        assert_eq!(app.status, "Plot stopped");
         assert_eq!(
             app.diagnostics[0].error.message,
             "Duplicate sequence label N10"

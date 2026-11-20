@@ -1,8 +1,19 @@
 use super::{history::History, session::Session};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, Sense, Stroke};
-use std::path::PathBuf;
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+};
 
 pub(super) const HEIGHT: f32 = 25.;
+const HISTORY_ROW_HEIGHT: f32 = 22.;
+const HISTORY_SCROLL_HEIGHT: f32 = 330.;
+const HISTORY_MAX_WIDTH: f32 = 540.;
+const HISTORY_NAME_SIZE: f32 = 12.;
+const HISTORY_DATE_SIZE: f32 = 11.;
+const HISTORY_LEFT_PAD: f32 = 6.;
+const HISTORY_RIGHT_PAD: f32 = 10.;
+const HISTORY_COLUMN_GAP: f32 = 12.;
 
 pub(super) struct Label {
     pub text: String,
@@ -184,17 +195,28 @@ impl Strip<'_> {
     pub fn history_menu(&mut self, response: &egui::Response) {
         let popup = egui::Popup::menu(response)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
-        if response.clicked() && !popup.is_open() {
+        let opening = response.clicked() && !popup.is_open();
+        if opening {
             self.history.open(self.session, &response.ctx);
+        } else if !popup.is_open() {
+            return;
         }
-        const ROW_HEIGHT: f32 = 24.;
-        let width = response
-            .ctx
-            .input(|input| (input.content_rect().width() - 24.).clamp(200., 540.));
         let history = &self.history;
+        let ctx = &response.ctx;
+        let layout_id = response.id.with("history-layout");
+        let (name_start, preferred_width) = match ctx.data(|data| data.get_temp(layout_id)) {
+            Some(layout) if !opening => layout,
+            _ => {
+                let layout = history_layout(ctx, history);
+                ctx.data_mut(|data| data.insert_temp(layout_id, layout));
+                layout
+            }
+        };
+        let width =
+            preferred_width.min(ctx.input(|input| (input.content_rect().width() - 24.).max(1.)));
         popup.width(width).show(|ui| {
             ui.set_width(width);
-            if history_row(ui, ROW_HEIGHT, "", "Sample", true).clicked() {
+            if history_row(ui, name_start, None, "Sample", true).clicked() {
                 self.commands.push(Command::Sample);
                 ui.close();
             }
@@ -203,9 +225,9 @@ impl Strip<'_> {
             }
             ui.separator();
             egui::ScrollArea::vertical()
-                .max_height(330.)
+                .max_height(HISTORY_SCROLL_HEIGHT)
                 .auto_shrink([false, true])
-                .show_rows(ui, ROW_HEIGHT, history.rows.len(), |ui, range| {
+                .show_rows(ui, HISTORY_ROW_HEIGHT, history.rows.len(), |ui, range| {
                     for recent in &history.rows[range] {
                         let path = &recent.path;
                         let date = chrono::DateTime::from_timestamp_micros(recent.opened as i64)
@@ -215,12 +237,9 @@ impl Strip<'_> {
                                     .to_string()
                             })
                             .unwrap_or_default();
-                        let name = path
-                            .file_name()
-                            .unwrap_or(path.as_os_str())
-                            .to_string_lossy();
+                        let name = history_name(path);
                         let available = !history.missing.contains(recent);
-                        let row = history_row(ui, ROW_HEIGHT, &date, &name, available);
+                        let row = history_row(ui, name_start, Some(&date), &name, available);
                         if row.on_hover_text(path.display().to_string()).clicked() {
                             self.commands.push(Command::Open(path.clone()));
                             ui.close();
@@ -231,10 +250,60 @@ impl Strip<'_> {
     }
 }
 
+fn history_name(path: &Path) -> Cow<'_, str> {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+}
+
+fn history_layout(ctx: &egui::Context, history: &History) -> (f32, f32) {
+    let style = ctx.global_style();
+    let spacing = &style.spacing;
+    let scroll_padding = if history.rows.len() as f32
+        * (HISTORY_ROW_HEIGHT + spacing.item_spacing.y)
+        > HISTORY_SCROLL_HEIGHT
+    {
+        let scroll = &spacing.scroll;
+        scroll.bar_width + scroll.bar_inner_margin + scroll.bar_outer_margin
+    } else {
+        0.
+    };
+    ctx.fonts_mut(|fonts| {
+        let date_width = fonts
+            .layout_no_wrap(
+                "2000-00-00".into(),
+                FontId::monospace(HISTORY_DATE_SIZE),
+                Color32::PLACEHOLDER,
+            )
+            .size()
+            .x;
+        let name_start = HISTORY_LEFT_PAD + date_width + HISTORY_COLUMN_GAP;
+        let margin = name_start + HISTORY_RIGHT_PAD + scroll_padding;
+        let mut width = margin;
+        for name in std::iter::once(Cow::Borrowed("Sample"))
+            .chain(history.rows.iter().map(|entry| history_name(&entry.path)))
+        {
+            let text_width = fonts
+                .layout_no_wrap(
+                    name.into_owned(),
+                    FontId::proportional(HISTORY_NAME_SIZE),
+                    Color32::PLACEHOLDER,
+                )
+                .size()
+                .x;
+            width = width.max(margin + text_width);
+            if width >= HISTORY_MAX_WIDTH {
+                break;
+            }
+        }
+        (name_start, width.ceil().min(HISTORY_MAX_WIDTH))
+    })
+}
+
 fn history_row(
     ui: &mut egui::Ui,
-    height: f32,
-    date: &str,
+    name_start: f32,
+    date: Option<&str>,
     name: &str,
     available: bool,
 ) -> egui::Response {
@@ -243,12 +312,12 @@ fn history_row(
     } else {
         Sense::hover()
     };
-    let (rect, row) = ui.allocate_exact_size(vec2(ui.available_width(), height), sense);
+    let (rect, row) = ui.allocate_exact_size(vec2(ui.available_width(), HISTORY_ROW_HEIGHT), sense);
     row.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::Role::Button,
             available,
-            format!("{date} {name}").trim(),
+            format!("{} {name}", date.unwrap_or_default()).trim(),
         )
     });
     let visuals = ui.style().interact(&row);
@@ -261,21 +330,43 @@ fn history_row(
     } else {
         ui.visuals().weak_text_color()
     };
-    if !date.is_empty() {
+    if let Some(date) = date {
         painter.text(
-            rect.left_center() + vec2(6., 0.),
+            rect.left_center() + vec2(HISTORY_LEFT_PAD, 0.),
             Align2::LEFT_CENTER,
             date,
-            FontId::monospace(12.),
+            FontId::monospace(HISTORY_DATE_SIZE),
             color,
         );
+    } else {
+        let center = rect.left_center()
+            + vec2(
+                (HISTORY_LEFT_PAD + name_start - HISTORY_COLUMN_GAP) / 2.,
+                0.,
+            );
+        let stroke = Stroke::new(1., color);
+        painter.add(egui::Shape::closed_line(
+            [(-4., -5.), (1., -5.), (4., -2.), (4., 5.), (-4., 5.)]
+                .map(|(x, y)| center + vec2(x, y))
+                .to_vec(),
+            stroke,
+        ));
+        painter.add(egui::Shape::line(
+            vec![
+                center + vec2(1., -5.),
+                center + vec2(1., -2.),
+                center + vec2(4., -2.),
+            ],
+            stroke,
+        ));
+        painter.line_segment([center + vec2(-2., 1.), center + vec2(2., 1.)], stroke);
     }
-    let name_x = rect.left() + 100.;
+    let name_x = rect.left() + name_start;
     let name = egui::WidgetText::from(name).into_galley(
         ui,
         Some(egui::TextWrapMode::Truncate),
-        (rect.right() - name_x - 6.).max(1.),
-        FontId::proportional(13.),
+        (rect.right() - name_x - HISTORY_RIGHT_PAD).max(1.),
+        FontId::proportional(HISTORY_NAME_SIZE),
     );
     painter.galley(
         pos2(name_x, rect.center().y - name.size().y / 2.),

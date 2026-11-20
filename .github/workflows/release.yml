@@ -1,0 +1,48 @@
+name: Windows release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  windows-x64:
+    runs-on: windows-2025
+    env:
+      RUSTUP_TOOLCHAIN: 1.95.0-x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+
+      - name: Test the interpreter
+        run: cargo test --locked --release -p cnc-core
+
+      - name: Build the desktop executable
+        run: |
+          ./tools/build.ps1
+          Copy-Item -LiteralPath 'output/desktop/CNC Viewer.exe' -Destination 'output/desktop/CNC-Viewer-windows-x64.exe'
+
+      - name: Check the packaged executable
+        run: |
+          $viewer = './output/desktop/CNC-Viewer-windows-x64.exe'
+          $reportJson = & $viewer inspect ./examples/goto-slots.nc | Out-String
+          if ($LASTEXITCODE -ne 0) { throw 'Inspection failed.' }
+          $report = $reportJson | ConvertFrom-Json
+          if ($report.validation -ne 'passed' -or $report.execution.scope -ne 'full' -or $report.summary.moves -ne 22) {
+              throw 'Unexpected inspection result.'
+          }
+          $guide = & $viewer --help agents | Out-String
+          if ($LASTEXITCODE -ne 0 -or $guide -notmatch '<!-- file: AGENTS\.md -->') {
+              throw 'The packaged agent guide is missing.'
+          }
+
+      - name: Publish the Windows x64 executable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$env:GITHUB_REF_NAME" 'output/desktop/CNC-Viewer-windows-x64.exe' --verify-tag --notes-from-tag --title "CNC Viewer $env:GITHUB_REF_NAME" --repo "$env:GITHUB_REPOSITORY"

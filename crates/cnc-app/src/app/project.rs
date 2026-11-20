@@ -200,7 +200,6 @@ impl App {
             self.settings = settings;
         }
         self.reset_disk_choices();
-        self.show_diagnostics = false;
         if self.capture_path.is_none() {
             self.popup = 0;
         }
