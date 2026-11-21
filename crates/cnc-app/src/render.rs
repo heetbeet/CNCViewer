@@ -70,6 +70,8 @@ struct DepthFrame {
     size: [u32; 2],
     sweep: wgpu::TextureView,
     sweep_depth: wgpu::TextureView,
+    halo: wgpu::TextureView,
+    halo_bind: wgpu::BindGroup,
     bind: wgpu::BindGroup,
 }
 
@@ -90,9 +92,10 @@ pub struct Plot {
     grid_count: u32,
     depth: wgpu::TextureView,
     sampled_depth: wgpu::TextureView,
+    halo: wgpu::RenderPipeline,
     depth_resolve: wgpu::RenderPipeline,
     depth_frame: Option<DepthFrame>,
-    depth_geometry: Option<wgpu::BindGroup>,
+    depth_geometry: Option<(wgpu::BindGroup, wgpu::BindGroup)>,
     trail: crate::trail::Trail,
     msaa: wgpu::TextureView,
     last_frame: Option<([f32; 24], Draw)>,
@@ -151,6 +154,9 @@ impl Plot {
         let mut path_depth = crate::trail::depth();
         path_depth.depth_compare = Some(wgpu::CompareFunction::LessEqual);
         path_depth.depth_write_enabled = Some(true);
+        path_depth.stencil.front.pass_op = wgpu::StencilOperation::Replace;
+        path_depth.stencil.back = path_depth.stencil.front;
+        path_depth.stencil.write_mask = 1;
         let pipeline = lines("CNC paths", path_depth.clone(), None);
         let grid_pipeline = lines(
             "CNC reference grid",
@@ -281,6 +287,47 @@ impl Plot {
         let view = texture.create_view(&Default::default());
         let (depth, sampled_depth) = Self::depth(&device, [1, 1]);
         let msaa = Self::msaa(&device, [1, 1]);
+        let mut halo_stencil = crate::trail::depth();
+        halo_stencil.stencil.front.compare = wgpu::CompareFunction::Equal;
+        halo_stencil.stencil.back = halo_stencil.stencil.front;
+        halo_stencil.stencil.read_mask = 1;
+        halo_stencil.stencil.write_mask = 0;
+        let strongest = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Max,
+        };
+        let halo = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Depth crossing halos"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_halo"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_halo"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R8Unorm,
+                    blend: Some(wgpu::BlendState {
+                        color: strongest,
+                        alpha: strongest,
+                    }),
+                    write_mask: wgpu::ColorWrites::RED,
+                })],
+            }),
+            primitive: Default::default(),
+            depth_stencil: Some(halo_stencil),
+            multisample: wgpu::MultisampleState {
+                count: 4,
+                ..Default::default()
+            },
+            multiview_mask: None,
+            cache: None,
+        });
         let depth_resolve = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Depth-aware plot resolve"),
             layout: None,
@@ -309,6 +356,7 @@ impl Plot {
         Self {
             depth,
             sampled_depth,
+            halo,
             depth_resolve,
             depth_frame: None,
             depth_geometry: None,
@@ -363,9 +411,22 @@ impl Plot {
         )
     }
     fn msaa(device: &wgpu::Device, size: [u32; 2]) -> wgpu::TextureView {
+        Self::sampled_msaa(
+            device,
+            size,
+            wgpu::TextureFormat::Rgba8Unorm,
+            "Antialiased plot",
+        )
+    }
+    fn sampled_msaa(
+        device: &wgpu::Device,
+        size: [u32; 2],
+        format: wgpu::TextureFormat,
+        label: &str,
+    ) -> wgpu::TextureView {
         device
             .create_texture(&wgpu::TextureDescriptor {
-                label: Some("Antialiased plot"),
+                label: Some(label),
                 size: wgpu::Extent3d {
                     width: size[0],
                     height: size[1],
@@ -374,7 +435,7 @@ impl Plot {
                 mip_level_count: 1,
                 sample_count: 4,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
@@ -689,14 +750,23 @@ impl Plot {
         let sweep_size = if sweep { size } else { [1, 1] };
         if depth_support && self.depth_geometry.is_none() {
             let entries = [&self.vertices, &self.grid, &self.live];
-            self.depth_geometry = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let halo = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Halo segment geometry"),
-                layout: &self.depth_resolve.get_bind_group_layout(1),
+                layout: &self.halo.get_bind_group_layout(1),
                 entries: &std::array::from_fn::<_, 3, _>(|i| wgpu::BindGroupEntry {
                     binding: i as u32,
                     resource: entries[i].as_entire_binding(),
                 }),
-            }));
+            });
+            let resolve = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Sweep segment geometry"),
+                layout: &self.depth_resolve.get_bind_group_layout(1),
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.vertices.as_entire_binding(),
+                }],
+            });
+            self.depth_geometry = Some((halo, resolve));
         }
         if depth_support
             && self
@@ -704,6 +774,31 @@ impl Plot {
                 .as_ref()
                 .is_none_or(|frame| frame.size != sweep_size)
         {
+            let (halo, halo_bind) = if let Some(frame) = self.depth_frame.take() {
+                (frame.halo, frame.halo_bind)
+            } else {
+                let halo = Self::sampled_msaa(
+                    &self.device,
+                    size,
+                    wgpu::TextureFormat::R8Unorm,
+                    "Crossing coverage",
+                );
+                let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Halo receiver layer"),
+                    layout: &self.halo.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.uniform.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&self.msaa),
+                        },
+                    ],
+                });
+                (halo, bind)
+            };
             let sweep = Self::msaa(&self.device, sweep_size);
             let (sweep_depth, sampled_sweep_depth) = Self::depth(&self.device, sweep_size);
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -730,12 +825,18 @@ impl Plot {
                         binding: 4,
                         resource: wgpu::BindingResource::TextureView(&sampled_sweep_depth),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&halo),
+                    },
                 ],
             });
             self.depth_frame = Some(DepthFrame {
                 size: sweep_size,
                 sweep,
                 sweep_depth,
+                halo,
+                halo_bind,
                 bind,
             });
         }
@@ -746,6 +847,10 @@ impl Plot {
                 .write_buffer(&self.live, 0, bytemuck::bytes_of(&live_vertices));
         }
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        let axes = self.grid_count.min(6);
+        let visible = self
+            .count
+            .min(segments.saturating_mul(2).min(u32::MAX as usize) as u32);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("CNC path pass"),
@@ -779,17 +884,17 @@ impl Plot {
                     }),
                     stencil_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(0),
-                        store: wgpu::StoreOp::Discard,
+                        store: if depth_support {
+                            wgpu::StoreOp::Store
+                        } else {
+                            wgpu::StoreOp::Discard
+                        },
                     }),
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            let axes = self.grid_count.min(6);
-            let visible = self
-                .count
-                .min(segments.saturating_mul(2).min(u32::MAX as usize) as u32);
             if self.count != 0 && show_grid {
                 pass.set_pipeline(&self.grid_pipeline);
                 pass.set_bind_group(0, &self.grid_bind, &[]);
@@ -798,6 +903,7 @@ impl Plot {
             }
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind, &[]);
+            pass.set_stencil_reference(u32::from(depth_support));
             if self.count != 0 {
                 pass.set_vertex_buffer(0, self.grid.slice(..));
                 pass.draw(0..axes, 0..1);
@@ -826,6 +932,8 @@ impl Plot {
             }
         }
         if let Some(frame) = self.depth_frame.as_ref().filter(|_| depth_support) {
+            let (halo_geometry, resolve_geometry) =
+                self.depth_geometry.as_ref().expect("Depth geometry");
             if sweep {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Cutter sweep layer"),
@@ -850,6 +958,35 @@ impl Plot {
                 });
                 self.trail.draw_depth_supported(&mut pass, segments);
             }
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Crossing halo coverage"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &frame.halo,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.depth,
+                        depth_ops: None,
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.halo);
+                pass.set_stencil_reference(1);
+                pass.set_bind_group(0, &frame.halo_bind, &[]);
+                pass.set_bind_group(1, halo_geometry, &[]);
+                pass.draw(0..6, 1..1 + visible / 2);
+                pass.draw(0..6, AXIS_FIRST..AXIS_FIRST + axes / 2);
+                if live.motion.is_some() {
+                    pass.draw(0..6, LIVE_SEGMENT..LIVE_SEGMENT + 1);
+                }
+            }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Depth-aware plot resolve"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -865,11 +1002,7 @@ impl Plot {
             });
             pass.set_pipeline(&self.depth_resolve);
             pass.set_bind_group(0, &frame.bind, &[]);
-            pass.set_bind_group(
-                1,
-                self.depth_geometry.as_ref().expect("Depth geometry"),
-                &[],
-            );
+            pass.set_bind_group(1, resolve_geometry, &[]);
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([encoder.finish()]);
@@ -1254,7 +1387,12 @@ mod tests {
                 .max()
                 .unwrap()
         };
-        assert!(strongest_blue(&top, 34) > strongest_blue(&halo, 34) + 15);
+        let attenuation = |x| strongest_blue(&top, x).saturating_sub(strongest_blue(&halo, x));
+        for [core, inner, outer] in [[34, 35, 36], [29, 28, 27]] {
+            assert!(attenuation(core) > attenuation(inner) + 15);
+            assert!(attenuation(inner) > attenuation(outer) + 15);
+            assert!(attenuation(outer) > 5, "Expected a soft edge at {outer}");
+        }
         assert_eq!(strongest_blue(&top, 38), strongest_blue(&halo, 38));
         assert_eq!(
             strongest_blue(&bottom, 34),

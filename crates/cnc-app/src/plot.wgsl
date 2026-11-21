@@ -15,7 +15,7 @@ const TRAIL_ALPHA: f32 = 0.28;
 const SWEEP_ALPHA: f32 = 0.48;
 const AXIS_FIRST = 0xfffffcu;
 const LIVE_SEGMENT = 0xffffffu;
-const HALO_WIDTH = 3.25;
+const HALO_RADIUS = 5.75;
 
 struct Out {
     @builtin(position) position: vec4<f32>,
@@ -110,6 +110,7 @@ fn fullscreen(index: u32) -> vec4<f32> {
 @group(0) @binding(2) var wire_depth: texture_depth_multisampled_2d;
 @group(0) @binding(3) var sweeps: texture_multisampled_2d<f32>;
 @group(0) @binding(4) var sweep_depth: texture_depth_multisampled_2d;
+@group(0) @binding(5) var halos: texture_multisampled_2d<f32>;
 
 // Matches the vertex buffer layout. The resolve uses endpoints to test the
 // crossing itself, rather than comparing unrelated depths at nearby pixels.
@@ -161,10 +162,10 @@ fn read_wire(pixel: vec2<i32>, index: i32) -> Wire {
     return Wire(color, owner, tag, depth);
 }
 
-fn read_sweep(pixel: vec2<i32>, index: i32) -> Sweep {
+fn read_sweep(pixel: vec2<i32>, index: i32, ignore: u32) -> Sweep {
     let raw = textureLoad(sweeps, pixel, index);
     let owner = decode_owner(raw.rgb);
-    if owner == 0u { return Sweep(0u, false, 1.0); }
+    if owner == 0u || owner == ignore { return Sweep(0u, false, 1.0); }
     return Sweep(owner, raw.a > 0.5, textureLoad(sweep_depth, pixel, index));
 }
 
@@ -178,43 +179,99 @@ fn depth_gap(near: f32, far: f32, offset: vec2<f32>, same_plane_basis: bool) -> 
     return far - near + correction - max(0.000001, 0.8 * length(gradient));
 }
 
-fn endpoint(owner: u32, end: u32) -> vec3<f32> {
-    if owner == LIVE_SEGMENT { return live_path[end].point; }
-    if owner >= AXIS_FIRST { return axes[(owner - AXIS_FIRST) * 2u + end].point; }
-    return path[(owner - 1u) * 2u + end].point;
+fn path_vertex(owner: u32, end: u32) -> PathVertex {
+    if owner == LIVE_SEGMENT { return live_path[end]; }
+    if owner >= AXIS_FIRST { return axes[(owner - AXIS_FIRST) * 2u + end]; }
+    return path[(owner - 1u) * 2u + end];
 }
 
-fn projected_endpoint(owner: u32, end: u32) -> vec3<f32> {
-    let clip = to_clip(endpoint(owner, end));
+fn screen_point(point: vec3<f32>) -> vec3<f32> {
+    let clip = to_clip(point);
     return vec3(clip.xy / camera.flags.yz, clip.z);
 }
 
 fn cross2(a: vec2<f32>, b: vec2<f32>) -> f32 { return a.x * b.y - a.y * b.x; }
 
-fn wire_halo(near: Wire, far: Wire, at: vec2<f32>) -> f32 {
-    if !is_line(near) || !is_line(far) || near.owner == far.owner { return 0.0; }
-    let a = projected_endpoint(near.owner, 0u);
-    let b = projected_endpoint(near.owner, 1u);
-    let c = projected_endpoint(far.owner, 0u);
-    let d = projected_endpoint(far.owner, 1u);
-    let length_a = length(b.xy - a.xy);
-    let length_b = length(d.xy - c.xy);
-    if min(length_a, length_b) < 0.0001 { return 0.0; }
-    let dir_a = (b.xy - a.xy) / length_a;
-    let dir_b = (d.xy - c.xy) / length_b;
-    let angle = cross2(dir_a, dir_b);
+struct ScreenLine {
+    start: vec3<f32>,
+    end: vec3<f32>,
+    direction: vec2<f32>,
+    span: f32,
+}
+
+fn screen_line(a: vec3<f32>, b: vec3<f32>) -> ScreenLine {
+    let start = screen_point(a);
+    let end = screen_point(b);
+    let delta = end.xy - start.xy;
+    let span = length(delta);
+    return ScreenLine(start, end, delta / max(span, 0.0001), span);
+}
+
+fn wire_halo(near: ScreenLine, far: ScreenLine, along: f32) -> f32 {
+    if min(near.span, far.span) < 0.0001 { return 0.0; }
+    let angle = cross2(near.direction, far.direction);
     // Nearly parallel strokes should not erase a band along the run.
     if abs(angle) < 0.24 { return 0.0; }
-    let delta = c.xy - a.xy;
-    let t_near = cross2(delta, dir_b) / angle;
-    let t_far = cross2(delta, dir_a) / angle;
-    if t_far < 0.0 || t_far > length_b ||
-        t_near < 0.0 || t_near > length_a { return 0.0; }
-    let near_z = mix(a.z, b.z, t_near / length_a);
-    let far_z = mix(c.z, d.z, t_far / length_b);
+    let delta = far.start.xy - near.start.xy;
+    let t_far = cross2(delta, near.direction) / angle;
+    let distance = abs(along - t_far);
+    if distance >= HALO_RADIUS || t_far < 0.0 || t_far > far.span { return 0.0; }
+    let t_near = cross2(delta, far.direction) / angle;
+    if t_near < 0.0 || t_near > near.span { return 0.0; }
+    let near_z = mix(near.start.z, near.end.z, t_near / near.span);
+    let far_z = mix(far.start.z, far.end.z, t_far / far.span);
     if far_z - near_z <= max(0.000001, 0.5 * camera.depth_scale.x) { return 0.0; }
-    let distance = abs(dot(at - c.xy, dir_b) - t_far);
-    return 1.0 - smoothstep(2.5, HALO_WIDTH, distance);
+    // Keep the crossing crisp and taper the Gaussian tail in screen points.
+    let tail = max(distance - 2.25, 0.0);
+    return exp2(-0.72 * tail * tail) * (1.0 - smoothstep(4.8, HALO_RADIUS, distance));
+}
+
+fn wire_owner(pixel: vec2<i32>, sample: i32) -> u32 {
+    let raw = textureLoad(wires, pixel, sample);
+    let tag = u32(round(raw.a * 255.0));
+    if tag >= 192u { return 0u; }
+    if tag < 64u { return AXIS_FIRST + (tag & 3u); }
+    return decode_owner(raw.rgb);
+}
+
+struct HaloVertex {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) start: vec3<f32>,
+    @location(1) @interpolate(flat) end: vec3<f32>,
+    @location(2) @interpolate(flat) direction: vec2<f32>,
+    @location(3) @interpolate(flat) span: f32,
+    @location(4) @interpolate(flat) owner: u32,
+}
+
+// Rasterize the caster's screen-space bounds. The stencil restricts the
+// fragment work to the visible wire samples that could receive its halo.
+@vertex fn vs_halo(@builtin(vertex_index) index: u32, @builtin(instance_index) owner: u32) -> HaloVertex {
+    let a = path_vertex(owner, 0u);
+    let b = path_vertex(owner, 1u);
+    let line = screen_line(a.point, b.point);
+    let rapid = (owner < AXIS_FIRST || owner == LIVE_SEGMENT) && a.color >> 24u < 230u;
+    var result = HaloVertex(vec4(2.0, 2.0, 0.0, 1.0), line.start, line.end, line.direction, line.span, owner);
+    if (rapid && camera.flags.x < 0.5) || line.span < 0.0001 { return result; }
+    let corners = array<vec2<f32>, 6>(vec2(0.0, -1.0), vec2(1.0, -1.0), vec2(0.0, 1.0),
+        vec2(0.0, 1.0), vec2(1.0, -1.0), vec2(1.0, 1.0));
+    let corner = corners[index];
+    let normal = vec2(-line.direction.y, line.direction.x);
+    let radius = HALO_RADIUS + camera.xy_depth.z;
+    let tangent = mix(-radius, line.span + radius, corner.x);
+    let point = line.start.xy + tangent * line.direction + corner.y * radius * normal;
+    result.position = vec4(point * camera.flags.yz, 0.0, 1.0);
+    return result;
+}
+
+@fragment fn fs_halo(input: HaloVertex, @builtin(sample_index) sample: u32) -> @location(0) f32 {
+    let pixel = vec2<i32>(input.position.xy);
+    let owner = wire_owner(pixel, i32(sample));
+    if owner == 0u || owner == input.owner { return 0.0; }
+    let far = screen_line(path_vertex(owner, 0u).point, path_vertex(owner, 1u).point);
+    let near = ScreenLine(input.start, input.end, input.direction, input.span);
+    let center = vec2<f32>(pixel) + vec2(0.5);
+    let at = (center * camera.xy_depth.z - 1.0 / camera.flags.yz) * vec2(1.0, -1.0);
+    return wire_halo(near, far, dot(at - far.start.xy, far.direction));
 }
 
 fn sweep_separation(surface: Sweep, far: f32, offset: vec2<f32>, horizontal: bool) -> f32 {
@@ -238,48 +295,38 @@ const NEIGHBORS = array<vec2<i32>, 16>(
 
 @fragment fn fs_resolve(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(position.xy);
-    let at = (position.xy * camera.xy_depth.z - 1.0 / camera.flags.yz) * vec2(1.0, -1.0);
     let show_sweep = camera.flags.w >= 2.0;
     let no_sweep = Sweep(0u, false, 1.0);
     var wire: array<Wire, 4>;
     var sweep: array<Sweep, 4>;
-    var front = Wire(CANVAS, 0u, 255u, 1.0);
     var front_sweep = no_sweep;
     var backdrop = CANVAS;
     var has_backdrop = false;
     for (var i = 0; i < 4; i++) {
         wire[i] = read_wire(pixel, i);
-        if wire[i].depth < front.depth { front = wire[i]; }
         if wire[i].depth == 1.0 && !has_backdrop {
             backdrop = wire[i].color;
             has_backdrop = true;
         }
         sweep[i] = no_sweep;
         if show_sweep {
-            sweep[i] = read_sweep(pixel, i);
+            sweep[i] = read_sweep(pixel, i, 0u);
             if sweep[i].depth < front_sweep.depth { front_sweep = sweep[i]; }
         }
     }
 
-    var line_gap = 0.0;
     var sweep_edge = 0.0;
-    if is_line(front) || front_sweep.owner != 0u {
+    if front_sweep.owner != 0u {
         let limit = vec2<i32>(textureDimensions(wires)) - vec2(1);
         let stride = max(1, i32(round(1.0 / camera.xy_depth.z)));
         for (var n = 0; n < 16; n++) {
             let neighbor = clamp(pixel + NEIGHBORS[n] * stride, vec2(0), limit);
             let offset = vec2<f32>(neighbor - pixel);
             let distance = length(offset) * camera.xy_depth.z;
-            if line_gap < 1.0 && is_line(front) {
-                // Read the samples individually so a thin stroke cannot vanish in the resolve.
+            if distance <= 2.5 {
                 for (var i = 0; i < 4; i++) {
-                    line_gap = max(line_gap, wire_halo(read_wire(neighbor, i), front, at));
-                }
-            }
-            if front_sweep.owner != 0u && distance <= 2.5 {
-                for (var i = 0; i < 4; i++) {
-                    let edge = read_sweep(neighbor, i);
-                    if edge.owner == 0u || edge.owner == front_sweep.owner { continue; }
+                    let edge = read_sweep(neighbor, i, front_sweep.owner);
+                    if edge.owner == 0u { continue; }
                     let strength = 1.0 - smoothstep(0.85, 2.5, distance);
                     let separation = sweep_separation(edge, front_sweep.depth, offset, front_sweep.planar);
                     sweep_edge = max(sweep_edge, strength * 0.75 * separation);
@@ -306,11 +353,7 @@ const NEIGHBORS = array<vec2<i32>, 16>(
             let separation = sweep_separation(surface, line.depth, vec2(0.0), planar(line));
             ink = mix(ink, pigment, SWEEP_ALPHA * separation);
         }
-        var gap = 0.0;
-        if is_line(line) {
-            gap = max(wire_halo(front, line, at),
-                select(0.0, line_gap, line.owner == front.owner));
-        }
+        let gap = select(0.0, textureLoad(halos, pixel, i).r, is_line(line));
         color += mix(ink, background, gap);
     }
     return vec4(color * 0.25, 1.0);
