@@ -15,7 +15,7 @@ Pass a JSON file as the second argument to `inspect FILE JOB.json`. Library and 
 
 Set `"depthSupport": true` in a PNG view to show halos at depth crossings and mute lines beneath the cutter trail. The trail shows the sweep of a flat-end cutter’s circular tip, including ramps, plunges and changing orientations.
 
-Declare the rotary axes in `setup.axisRoles`. Use `"rotaryMode":"head"` when XYZ is the tool-tip position and A/B/C orient the spindle about that tip. The default `"table"` mode rotates both position and orientation about the viewer origin, using the existing A/B/C axis order and signs. In the desktop app, load this JSON through Machine Options and enable five-axis movement. These modes describe ideal poses. Stock sections and numeric cutter-footprint checks still require a vertical tool.
+Declare the rotary axes in `setup.axisRoles`. Use `"rotaryMode":"head"` when XYZ is the tool-tip position and A/B/C orient the spindle about that tip. The default `"table"` mode rotates both position and orientation about the viewer origin, using the existing A/B/C axis order and signs. In the desktop app, load the setup JSON through Machine Options, or save it beside the program as `part.nc.setup.json` before opening `part.nc`. Enable five-axis movement. These modes describe ideal poses. Stock sections and numeric cutter-footprint checks still require a vertical tool.
 
 For changing angles, the visual sweep targets 0.05 mm of interpolation error, plus the faceting of the disc rim. View regions and camera coordinates use the displayed pose in rotary jobs.
 

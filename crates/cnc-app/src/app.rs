@@ -494,13 +494,7 @@ impl App {
         };
         let result = (|| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
             let text = crate::cli::input(path.to_str().ok_or("Invalid setup filename")?)?;
-            let setup: serde_json::Value =
-                serde_json::from_str(text.trim_start_matches('\u{feff}'))?;
-            if !setup.is_object() {
-                return Err("Machine setup must be a JSON object".into());
-            }
-            cnc_core::engine::validate_setup(setup.clone())?;
-            Ok(setup)
+            parse_machine_setup(&text)
         })();
         match result {
             Ok(setup) => {
@@ -1121,6 +1115,11 @@ impl App {
         self.stationary_state()
             .map_or([0.; 3], |state| state.rotation)
     }
+    fn tool_marker(&self, length: f64, rotation: [f64; 3]) -> Option<[[f64; 3]; 2]> {
+        let tip = self.model.rotary_mode.tip(self.position()?, rotation);
+        let axis = cnc_core::geometry::rotate_point([0., 0., length], rotation);
+        Some([tip, std::array::from_fn(|i| tip[i] + axis[i])])
+    }
     fn dro(&self) -> ([f64; 6], bool) {
         let Some(state) = self.model.executions.get(self.step) else {
             return ([0.; 6], false);
@@ -1294,12 +1293,8 @@ impl App {
             };
             (endpoints, segment.rapid)
         });
-        let tool = self.position().map(|point| {
-            let length = (self.camera.scale * rect.height() as f64 / 20.).max(2.);
-            let tip = self.model.rotary_mode.tip(point, rotation);
-            let axis = cnc_core::geometry::rotate_point([0., 0., length], rotation);
-            [tip, std::array::from_fn(|i| tip[i] + axis[i])]
-        });
+        let length = (self.camera.scale * rect.height() as f64 / 20.).max(2.);
+        let tool = self.tool_marker(length, rotation);
         let resized = self.plot.render(
             size,
             dpi as f64,
@@ -1333,6 +1328,15 @@ impl App {
         );
     }
 }
+fn parse_machine_setup(text: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let setup: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))?;
+    if !setup.is_object() {
+        return Err("Machine setup must be a JSON object".into());
+    }
+    cnc_core::engine::validate_setup(setup.clone())?;
+    Ok(setup)
+}
+
 fn read_document(
     path: &std::path::Path,
 ) -> Result<(String, String, disk::File), Box<dyn std::error::Error>> {
@@ -1777,6 +1781,41 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("cnc-viewer-save-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let tilt = dir.join("tilted-ramp.nc");
+        let tilt_setup = dir.join("tilted-ramp.nc.setup.json");
+        std::fs::write(&tilt, "G21 G90\nG0 X14 Y20 Z8 B55\nG1 X40 Z3 F100\nM30\n").unwrap();
+        std::fs::write(
+            &tilt_setup,
+            r#"{"rotaryMode":"head","axisRoles":{"B":"rotary"}}"#,
+        )
+        .unwrap();
+        let project = project::Project::open("tilt-test".into(), &tilt).unwrap();
+        let model = inspect(
+            &project.documents[&project.main],
+            &project.main,
+            &Default::default(),
+            &Options {
+                setup: project.setup,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(model.status, "complete");
+        let previous = std::mem::replace(&mut app.model, Arc::new(model));
+        app.seek(app.model.executions.len() - 1);
+        let rotation = app.tool_rotation();
+        assert_eq!(rotation, [0., 55., 0.]);
+        let [tip, top] = app.tool_marker(8., rotation).unwrap();
+        assert_eq!(tip, [40., 20., 3.]);
+        let mut front = Camera::default();
+        front.view("front");
+        let [a, b] = [front.project(tip), front.project(top)];
+        assert!(b[0] < a[0] && b[1] < a[1], "{a:?} -> {b:?}");
+        let angle = ((top[2] - tip[2]) / 8.).acos().to_degrees();
+        assert!((angle - 55.).abs() < 1e-9);
+        app.model = previous;
+        std::fs::remove_file(tilt_setup).unwrap();
+        std::fs::remove_file(tilt).unwrap();
         let first = dir.join("first.nc");
         let second = dir.join("second.nc");
         std::fs::write(&first, "G0 X1\nM30").unwrap();
