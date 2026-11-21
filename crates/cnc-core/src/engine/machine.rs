@@ -138,13 +138,43 @@ impl Engine {
         }
         let start_rotation = self.rotation_for(self.position);
         let end_rotation = self.rotation_for(end);
+        let entry = self.first && rapid;
         let rotary_distance = distance(&start_rotation, &end_rotation);
-        if points.len() == 2 && rotary_distance > 0. {
-            let count = (rotary_distance / 2.).ceil().clamp(16., 4096.) as usize;
-            let [start, end] = [points[0], points[1]];
-            points = (0..=count)
-                .map(|i| interpolate(start, end, i as f64 / count as f64))
-                .collect();
+        if !entry && points.len() >= 2 && rotary_distance > 0. {
+            use crate::geometry::{rotary_turn, table_bend, RotaryMode, ROTARY_CHORD_ERROR_MM};
+            let spans = points.len() - 1;
+            let per_span_turn = rotary_turn(start_rotation, end_rotation) / spans as f64;
+            let bend = if self.model.rotary_mode == RotaryMode::Table {
+                points
+                    .windows(2)
+                    .map(|p| table_bend(p[0], p[1], per_span_turn))
+                    .fold(0., f64::max)
+            } else {
+                0.
+            };
+            let error_pieces = (bend / (8. * ROTARY_CHORD_ERROR_MM)).sqrt();
+            let angle_pieces = rotary_distance / (2. * spans as f64);
+            let minimum = if spans == 1 { 16. } else { 1. };
+            let pieces = error_pieces.max(angle_pieces).ceil().max(minimum) as usize;
+            if pieces > 1 {
+                let count = spans
+                    .checked_mul(pieces)
+                    .filter(|&count| {
+                        count <= self.max_segments.saturating_sub(self.model.segments.len())
+                    })
+                    .ok_or_else(|| {
+                        NcError::new("Rotary geometry exceeds the segment limit").code("LIMIT")
+                    })?;
+                let mut refined = Vec::with_capacity(count + 1);
+                for pair in points.windows(2) {
+                    refined.extend(
+                        (0..pieces)
+                            .map(|i| interpolate(pair[0], pair[1], i as f64 / pieces as f64)),
+                    );
+                }
+                refined.push(*points.last().unwrap());
+                points = refined;
+            }
         }
         if self
             .model
@@ -171,7 +201,6 @@ impl Engine {
         let start = [self.position[0], self.position[1], self.position[2]];
         let endpoint = [end[0], end[1], end[2]];
         let segment_start = self.model.segments.len();
-        let entry = self.first && rapid;
         let length = if entry {
             0.
         } else {

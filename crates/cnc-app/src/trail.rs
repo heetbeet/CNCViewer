@@ -1,7 +1,8 @@
 use cnc_core::engine::{Model, Segment};
-use cnc_core::geometry::{interpolate, Point};
+use cnc_core::geometry::{interpolate, Point, RotaryMode};
 use eframe::wgpu::{self, util::DeviceExt};
 use std::sync::Arc;
+mod rotary;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -25,18 +26,23 @@ fn connected(before: &Segment, after: &Segment, fallback: Option<f64>) -> bool {
     !before.rapid
         && !after.rapid
         && before.end == after.start
+        && before.rotation == after.start_rotation
         && before.tool == after.tool
         && before.tool_diameter.or(fallback) == after.tool_diameter.or(fallback)
 }
 
 pub(crate) fn continues_slope(before: &Segment, after: &Segment) -> bool {
-    connected(before, after, None)
-        && slope(before).signum() == slope(after).signum()
-        && (0..2).all(|axis| {
-            let a = (before.end[axis] - before.start[axis]) * slope(after);
-            let b = (after.end[axis] - after.start[axis]) * slope(before);
-            (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0)
-        })
+    if !connected(before, after, None) {
+        return false;
+    }
+    if before.start_rotation != before.rotation || after.start_rotation != after.rotation {
+        return before.movement == after.movement;
+    }
+    let a = rotary::sub(before.end, before.start);
+    let b = rotary::sub(after.end, after.start);
+    let cross = rotary::cross(a, b);
+    rotary::dot(a, b) > 0.
+        && rotary::dot(cross, cross) <= 1e-18 * rotary::dot(a, a) * rotary::dot(b, b)
 }
 
 #[derive(Clone, Copy)]
@@ -52,6 +58,8 @@ pub struct PreparedTrail {
     vertices: Option<wgpu::Buffer>,
     ranges: Arc<[SweepRange]>,
     diameter: f64,
+    rotary_mode: Option<RotaryMode>,
+    radius: f64,
 }
 
 pub struct Trail {
@@ -64,6 +72,8 @@ pub struct Trail {
     vertices: wgpu::Buffer,
     ranges: Arc<[SweepRange]>,
     diameter: f64,
+    rotary_mode: Option<RotaryMode>,
+    radius: f64,
     partial_vertices: wgpu::Buffer,
     partial: Option<(usize, f64, u32, u32)>,
 }
@@ -199,6 +209,8 @@ impl Trail {
             }),
             ranges: Arc::default(),
             diameter: 0.,
+            rotary_mode: None,
+            radius: 0.,
             partial: None,
             partial_vertices: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Partial cutter sweep"),
@@ -211,8 +223,12 @@ impl Trail {
     pub fn diameter(&self) -> f64 {
         self.diameter
     }
+    pub fn radius(&self) -> f64 {
+        self.radius
+    }
     pub fn invalidate(&mut self) {
         self.diameter = 0.;
+        self.radius = 0.;
         self.partial = None;
         self.ranges = Arc::default();
     }
@@ -221,6 +237,8 @@ impl Trail {
             vertices: (!self.ranges.is_empty()).then(|| self.vertices.clone()),
             ranges: self.ranges.clone(),
             diameter: self.diameter,
+            rotary_mode: self.rotary_mode,
+            radius: self.radius,
         })
     }
     pub fn load(
@@ -229,11 +247,12 @@ impl Trail {
         model: &Model,
         diameter: f64,
         origin: [f64; 3],
+        five_axis: bool,
     ) -> Result<(), String> {
         if self.diameter == diameter {
             return Ok(());
         }
-        let data = Self::prepare(device, model, diameter, origin, None)?;
+        let data = Self::prepare(device, model, diameter, origin, five_axis, None)?;
         self.install(data);
         Ok(())
     }
@@ -242,6 +261,7 @@ impl Trail {
         model: &Model,
         diameter: f64,
         origin: Point,
+        five_axis: bool,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<PreparedTrail, String> {
         if model.segments.iter().filter(|s| !s.rapid).count() > 50000 {
@@ -249,19 +269,15 @@ impl Trail {
                 "Toolbit trail exceeds 50,000 cutting segments; use a shorter prefix".into(),
             );
         }
-        if model.segments.iter().filter(|s| !s.rapid).any(|s| {
-            s.rotation
-                .iter()
-                .chain(&s.start_rotation)
-                .any(|v| v.abs() > 1e-9)
-        }) {
-            return Err("Toolbit trail currently requires a vertical cutter".into());
-        }
+        let rotary_mode = five_axis.then_some(model.rotary_mode);
+        let mesh_limit = (device.limits().max_buffer_size / size_of::<SweepVertex>() as u64)
+            .min(50_000 * MAX_SWEEP_VERTICES as u64) as usize;
+        let mut maximum_radius = 0_f64;
         let mut ranges = Vec::new();
         let mut vertices = Vec::new();
         let mut brush_start = 0;
         for (index, segment) in model.segments.iter().enumerate() {
-            if index % 256 == 0
+            if (index % 256 == 0 || (five_axis && segment.start_rotation != segment.rotation))
                 && cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
             {
                 return Err("Plot cancelled".into());
@@ -284,14 +300,23 @@ impl Trail {
                 brush_start = vertices.len() as u32;
             }
             let joins = (u32::from(previous) * JOINS_PREVIOUS) | (u32::from(next) * JOINS_NEXT);
-            sweep_mesh(
+            sweep_move(
                 &mut vertices,
-                segment.start,
-                segment.end,
+                segment,
+                1.,
                 radius,
                 origin,
                 (index as u32 + 1) | joins,
-            );
+                rotary_mode,
+            )?;
+            if vertices.len() > mesh_limit {
+                return Err(
+                    "Toolbit trail exceeds the graphics mesh budget. Plot a shorter prefix.".into(),
+                );
+            }
+            if five_axis && (segment.start_rotation != [0.; 3] || segment.rotation != [0.; 3]) {
+                maximum_radius = maximum_radius.max(radius + 0.05);
+            }
             ranges.push(SweepRange {
                 step: index + 1,
                 brush: brush_start,
@@ -313,6 +338,8 @@ impl Trail {
             vertices,
             ranges: ranges.into(),
             diameter,
+            rotary_mode,
+            radius: maximum_radius,
         })
     }
     pub fn install(&mut self, data: PreparedTrail) {
@@ -321,10 +348,13 @@ impl Trail {
         }
         self.ranges = data.ranges;
         self.diameter = data.diameter;
+        self.rotary_mode = data.rotary_mode;
+        self.radius = data.radius;
         self.partial = None;
     }
     pub fn partial(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         request: Option<(&Segment, usize, f64)>,
         origin: Point,
@@ -343,15 +373,28 @@ impl Trail {
                 .map(|position| self.ranges[position]);
             if let Some(range) = range {
                 let mut vertices = Vec::with_capacity(MAX_SWEEP_VERTICES);
-                let end = interpolate(segment.start, segment.end, fraction);
-                sweep_mesh(
+                if sweep_move(
                     &mut vertices,
-                    segment.start,
-                    end,
+                    segment,
+                    fraction.clamp(0., 1.),
                     segment.tool_diameter.unwrap_or(self.diameter) / 2.,
                     origin,
                     (index as u32 + 1) | range.joins,
-                );
+                    self.rotary_mode,
+                )
+                .is_err()
+                {
+                    return self.partial.take().is_some();
+                }
+                let size = (vertices.len() * size_of::<SweepVertex>()) as u64;
+                if size > self.partial_vertices.size() {
+                    self.partial_vertices = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Partial rotary cutter sweep"),
+                        size,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                }
                 queue.write_buffer(&self.partial_vertices, 0, bytemuck::cast_slice(&vertices));
                 self.partial = Some((index, fraction, range.brush, vertices.len() as u32));
                 return true;
@@ -430,6 +473,78 @@ impl Trail {
     }
 }
 
+fn sweep_move(
+    vertices: &mut Vec<SweepVertex>,
+    segment: &Segment,
+    fraction: f64,
+    radius: f64,
+    origin: Point,
+    owner: u32,
+    mode: Option<RotaryMode>,
+) -> Result<(), String> {
+    let a = segment.start;
+    let b = if fraction == 1. {
+        segment.end
+    } else {
+        interpolate(a, segment.end, fraction)
+    };
+    let angles = if mode.is_some() {
+        [
+            segment.start_rotation,
+            if fraction == 1. {
+                segment.rotation
+            } else {
+                interpolate(segment.start_rotation, segment.rotation, fraction)
+            },
+        ]
+    } else {
+        [[0.; 3]; 2]
+    };
+    if angles == [[0.; 3]; 2] {
+        sweep_mesh(vertices, a, b, radius, origin, owner, None);
+        return Ok(());
+    }
+    let mode = mode.expect("Rotary cutter mode");
+    if angles[0] == angles[1] {
+        let frame = rotary::Frame::new(a, angles[0], mode, origin);
+        let end = frame.local(rotary::sub(
+            rotary::sub(mode.tip(b, angles[1]), origin),
+            frame.center,
+        ));
+        sweep_mesh(vertices, [0.; 3], end, radius, [0.; 3], owner, Some(&frame));
+        return Ok(());
+    }
+
+    let spin = angles.iter().all(|a| a[0] == 0. && a[1] == 0.);
+    let count = rotary::intervals(a, b, angles, radius, mode, spin)?;
+    let mut first = rotary::sample(a, b, angles, mode, origin, 0.);
+    for i in 1..=count {
+        let last = rotary::sample(a, b, angles, mode, origin, i as f64 / count as f64);
+        if spin {
+            sweep_mesh(
+                vertices,
+                first.center,
+                last.center,
+                radius,
+                [0.; 3],
+                owner,
+                None,
+            );
+        } else {
+            rotary::bridge(&first, &last, radius, |triangle| {
+                for point in triangle {
+                    vertices.push(SweepVertex {
+                        point: point.map(|v| v as f32),
+                        owner: owner | VOLUME,
+                    });
+                }
+            });
+        }
+        first = last;
+    }
+    Ok(())
+}
+
 fn sweep_mesh(
     vertices: &mut Vec<SweepVertex>,
     a: Point,
@@ -437,6 +552,7 @@ fn sweep_mesh(
     radius: f64,
     origin: Point,
     owner: u32,
+    frame: Option<&rotary::Frame>,
 ) {
     let unit_circle = std::sync::OnceLock::get_or_init(&UNIT_CIRCLE, || {
         std::array::from_fn(|i| {
@@ -444,11 +560,19 @@ fn sweep_mesh(
             [angle.cos(), angle.sin()]
         })
     });
+    let tilted = frame.is_some_and(|frame| !frame.horizontal());
     let mut triangle = |a, b, c, flags| {
+        let flags = if tilted {
+            (flags & !PLANAR) | VOLUME
+        } else {
+            flags
+        };
         for p in [a, b, c] {
             let p: Point = p;
             vertices.push(SweepVertex {
-                point: std::array::from_fn(|i| (p[i] - origin[i]) as f32),
+                point: frame
+                    .map_or_else(|| rotary::sub(p, origin), |frame| frame.point(p))
+                    .map(|v| v as f32),
                 owner: owner | flags,
             });
         }

@@ -13,7 +13,11 @@ Pass a JSON file as the second argument to `inspect FILE JOB.json`. Library and 
 }
 ```
 
-Set `"depthSupport": true` in a PNG view to show halos at depth crossings and mute lines beneath the cutter trail. For a vertical flat-end cutter, the trail shows the volume swept by the end disc on ramps and plunges. Use a stock section to measure the resulting surface.
+Set `"depthSupport": true` in a PNG view to show halos at depth crossings and mute lines beneath the cutter trail. The trail shows the sweep of a flat-end cutter’s circular tip, including ramps, plunges and changing orientations.
+
+Declare the rotary axes in `setup.axisRoles`. Use `"rotaryMode":"head"` when XYZ is the tool-tip position and A/B/C orient the spindle about that tip. The default `"table"` mode rotates both position and orientation about the viewer origin, using the existing A/B/C axis order and signs. In the desktop app, load this JSON through Machine Options and enable five-axis movement. These modes describe ideal poses. Stock sections and numeric cutter-footprint checks still require a vertical tool.
+
+For changing angles, the visual sweep targets 0.05 mm of interpolation error, plus the faceting of the disc rim. View regions and camera coordinates use the displayed pose in rotary jobs.
 
 Set `setup.initialPosition` and `setup.workOffsets` when the program relies on a known start or fixture zero. For example, `"setup":{"initialPosition":[100,40,25],"workOffsets":{"55":[100,40,20]}}` puts the tool tip 5 mm above the G55 origin. Report coordinates and check targets use machine tool-tip XYZ, so convert expected work coordinates using the supplied offset. Use `setup.variables` for initial macro values and `setup.tools` for numbered tool data. Follow the report's `requirements` for any other machine inputs.
 

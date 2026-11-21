@@ -792,7 +792,7 @@ impl App {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Home)) {
                 self.camera = Camera::default();
                 self.camera.fit(
-                    self.model.bounds,
+                    crate::render::backplot_bounds(&self.model, self.settings.five_axis),
                     self.canvas_size.x as f64,
                     self.canvas_size.y as f64,
                 );
@@ -880,7 +880,7 @@ impl App {
                     }
                     if fit_camera {
                         self.camera.fit(
-                            self.model.bounds,
+                            crate::render::backplot_bounds(&self.model, self.settings.five_axis),
                             self.canvas_size.x as f64,
                             self.canvas_size.y as f64,
                         );
@@ -1219,7 +1219,7 @@ impl App {
                         continue;
                     }
                     let end = if self.settings.five_axis {
-                        cnc_core::geometry::rotate_point(segment.end, segment.rotation)
+                        self.model.rotary_mode.tip(segment.end, segment.rotation)
                     } else {
                         segment.end
                     };
@@ -1284,8 +1284,10 @@ impl App {
             let end = cnc_core::geometry::interpolate(segment.start, segment.end, fraction);
             let endpoints = if self.settings.five_axis {
                 [
-                    cnc_core::geometry::rotate_point(segment.start, segment.start_rotation),
-                    cnc_core::geometry::rotate_point(end, rotation),
+                    self.model
+                        .rotary_mode
+                        .tip(segment.start, segment.start_rotation),
+                    self.model.rotary_mode.tip(end, rotation),
                 ]
             } else {
                 [segment.start, end]
@@ -1294,8 +1296,9 @@ impl App {
         });
         let tool = self.position().map(|point| {
             let length = (self.camera.scale * rect.height() as f64 / 20.).max(2.);
-            let top = [point[0], point[1], point[2] + length];
-            [point, top].map(|end| cnc_core::geometry::rotate_point(end, rotation))
+            let tip = self.model.rotary_mode.tip(point, rotation);
+            let axis = cnc_core::geometry::rotate_point([0., 0., length], rotation);
+            [tip, std::array::from_fn(|i| tip[i] + axis[i])]
         });
         let resized = self.plot.render(
             size,

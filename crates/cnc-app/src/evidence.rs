@@ -4,9 +4,9 @@ use crate::{
     render::{Draw, Plot},
 };
 use cnc_core::{
-    analysis::{point, sweeps},
+    analysis::{cutter_diameter, point},
     engine::{Model, Segment},
-    geometry::Point,
+    geometry::{Point, RotaryMode, ROTARY_CHORD_ERROR_MM},
     motion::Selection,
 };
 use serde_json::{json, Value};
@@ -52,11 +52,20 @@ fn step(value: &Value, default: usize, count: usize) -> Result<usize> {
         .ok_or_else(|| "View step is outside the executed prefix".into())
 }
 
-fn intersects(segment: &Segment, (min, max): Bounds, padding: f64) -> bool {
+fn intersects(segment: &Segment, (min, max): Bounds, padding: f64, rotary: RotaryMode) -> bool {
+    let a = rotary.tip(segment.start, segment.start_rotation);
+    let b = rotary.tip(segment.end, segment.rotation);
+    let tilted = [segment.start_rotation, segment.rotation]
+        .iter()
+        .any(|angles| angles[0] != 0. || angles[1] != 0.);
+    let bend = if rotary == RotaryMode::Table && segment.start_rotation != segment.rotation {
+        ROTARY_CHORD_ERROR_MM
+    } else {
+        0.
+    };
     (0..3).all(|i| {
-        let margin = if i == 2 { 0. } else { padding };
-        segment.start[i].max(segment.end[i]) + margin >= min[i]
-            && segment.start[i].min(segment.end[i]) - margin <= max[i]
+        let margin = bend + if i == 2 && !tilted { 0. } else { padding };
+        a[i].max(b[i]) + margin >= min[i] && a[i].min(b[i]) - margin <= max[i]
     })
 }
 
@@ -166,14 +175,19 @@ pub fn capture(
     } else {
         0.
     };
-    let mut filtered = Model::default();
+    let mut filtered = Model {
+        rotary_mode: model.rotary_mode,
+        ..Model::default()
+    };
     filtered.segments.extend(
         selection
             .segments(model)
             .map(|(_, segment)| segment)
             .filter(|segment| {
                 (from..=to).contains(&segment.step)
-                    && region.is_none_or(|region| intersects(segment, region, padding))
+                    && region.is_none_or(|region| {
+                        intersects(segment, region, padding, model.rotary_mode)
+                    })
             })
             .cloned(),
     );
@@ -189,16 +203,19 @@ pub fn capture(
         }
     }
     if show_trail {
-        let resolved = sweeps(&filtered, &json!({"cutter":cutter}))?;
-        for sweep in resolved {
-            filtered.segments[sweep.witness].tool_diameter = Some(sweep.diameter);
+        for segment in filtered
+            .segments
+            .iter_mut()
+            .filter(|segment| !segment.rapid)
+        {
+            segment.tool_diameter = Some(cutter_diameter(segment, &cutter)?);
         }
     }
     if let Some((min, max)) = focus {
         camera.fit_box(min, max, width.into(), height.into());
     } else {
         camera.fit(
-            filtered.bounds.or(model.bounds),
+            crate::render::backplot_bounds(&filtered, true).or(model.bounds),
             width.into(),
             height.into(),
         );

@@ -48,6 +48,39 @@ pub fn distance(a: &[f64], b: &[f64]) -> f64 {
 pub fn interpolate(a: Point, b: Point, t: f64) -> Point {
     std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RotaryMode {
+    #[default]
+    Table,
+    Head,
+}
+
+impl RotaryMode {
+    pub fn tip(self, point: Point, angles: Point) -> Point {
+        match self {
+            Self::Table => rotate_point(point, angles),
+            Self::Head => point,
+        }
+    }
+}
+
+pub const ROTARY_CHORD_ERROR_MM: f64 = 0.025;
+
+pub fn rotary_turn(start: Point, end: Point) -> f64 {
+    start
+        .into_iter()
+        .zip(end)
+        .map(|(a, b)| (b - a).abs().to_radians())
+        .sum()
+}
+
+pub fn table_bend(a: Point, b: Point, turn: f64) -> f64 {
+    let distance_from_pivot = distance(&a, &[0.; 3]).max(distance(&b, &[0.; 3]));
+    turn * (turn * distance_from_pivot + 2. * distance(&a, &b))
+}
+
 pub fn rotate_point(point: Point, angles: Point) -> Point {
     if angles == [0.; 3] {
         return point;

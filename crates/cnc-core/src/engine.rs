@@ -2,7 +2,7 @@ use crate::{
     arithmetic,
     compiler::{compile_cancellable, Library},
     error::{integer, NcError, Result, UNASSIGNED_VARIABLE},
-    geometry::{arc_points, distance, interpolate, Arc as Circle, Point},
+    geometry::{arc_points, distance, interpolate, Arc as Circle, Point, RotaryMode},
 };
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,7 @@ pub struct Model {
     pub events: Vec<Value>,
     pub variable_numbers: BTreeSet<u32>,
     pub bounds: Option<(Point, Point)>,
+    pub rotary_mode: RotaryMode,
 }
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -409,6 +410,12 @@ impl Engine {
                 ));
             }
         }
+        let rotary_mode = match setup.get("rotaryMode") {
+            None => RotaryMode::Table,
+            Some(value) if value == "table" => RotaryMode::Table,
+            Some(value) if value == "head" => RotaryMode::Head,
+            _ => return Err(NcError::new("rotaryMode must be table or head")),
+        };
         let position = pose(&setup["initialPosition"])?;
         if position.iter().any(|v| v.abs() > 1e9) {
             return Err(NcError::new("Initial coordinates exceed the numeric range"));
@@ -456,6 +463,7 @@ impl Engine {
             setup,
             model: Model {
                 status: "complete".into(),
+                rotary_mode,
                 ..Model::default()
             },
             frames: Vec::new(),
