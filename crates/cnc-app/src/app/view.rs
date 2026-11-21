@@ -1678,7 +1678,7 @@ impl App {
         ) {
             self.camera.view("iso");
             self.camera.fit(
-                self.model.bounds,
+                crate::render::backplot_bounds(&self.model, self.settings.five_axis),
                 self.canvas_size.x as f64,
                 self.canvas_size.y as f64,
             );

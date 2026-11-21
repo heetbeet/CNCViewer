@@ -1,4 +1,4 @@
-use super::{disk, find, read_document, session, App, Camera, Settings};
+use super::{disk, find, parse_machine_setup, read_document, session, App, Camera, Settings};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -68,7 +68,7 @@ impl Project {
         }
     }
 
-    pub fn open(id: String, path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    fn open_document(id: String, path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let (name, text, file) = read_document(path)?;
         let mut project = Self::new(id, &name, "");
         project.documents.insert(name.clone(), text);
@@ -76,8 +76,24 @@ impl Project {
         Ok(project)
     }
 
+    pub fn open(id: String, path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut project = Self::open_document(id, path)?;
+        let mut setup = path.as_os_str().to_os_string();
+        setup.push(".setup.json");
+        let setup = PathBuf::from(setup);
+        match std::fs::read_to_string(&setup) {
+            Ok(text) => {
+                project.setup = parse_machine_setup(&text)
+                    .map_err(|error| format!("{}: {error}", setup.display()))?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{}: {error}", setup.display()).into()),
+        }
+        Ok(project)
+    }
+
     pub fn restore(tab: &session::OpenTab) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut project = Self::open(tab.id.clone(), &tab.path)?;
+        let mut project = Self::open_document(tab.id.clone(), &tab.path)?;
         project.opened = tab.opened;
         project.edited = tab.edited;
         project.setup.clone_from(&tab.setup);

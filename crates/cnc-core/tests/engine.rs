@@ -13,6 +13,27 @@ fn run(text: &str, setup: Value) -> cnc_core::engine::Model {
     )
     .unwrap()
 }
+
+#[test]
+fn rotary_table_tip_chords_stay_within_the_display_tolerance() {
+    use cnc_core::geometry::{distance, interpolate, RotaryMode, ROTARY_CHORD_ERROR_MM};
+    let model = run(
+        "G0 X300\nG1 C90 F100\nM30\n",
+        json!({"axisRoles":{"C":"rotary"}}),
+    );
+    assert_eq!(model.rotary_mode, RotaryMode::Table);
+    assert_eq!(model.status, "complete");
+    assert!(model.segments.len() > 45);
+    for s in model.segments {
+        let start = model.rotary_mode.tip(s.start, s.start_rotation);
+        let end = model.rotary_mode.tip(s.end, s.rotation);
+        let middle = model.rotary_mode.tip(
+            interpolate(s.start, s.end, 0.5),
+            interpolate(s.start_rotation, s.rotation, 0.5),
+        );
+        assert!(distance(&interpolate(start, end, 0.5), &middle) <= ROTARY_CHORD_ERROR_MM);
+    }
+}
 #[test]
 fn macro_programs_produce_expected_linear_moves() {
     let expected_motion: Value =

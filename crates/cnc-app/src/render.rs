@@ -7,6 +7,26 @@ use std::{io::BufWriter, path::Path};
 const AXIS_FIRST: u32 = 0xff_ff_fc;
 pub(crate) const LIVE_SEGMENT: u32 = 0xff_ff_ff;
 
+pub(crate) fn backplot_bounds(model: &Model, five_axis: bool) -> Option<(Point, Point)> {
+    if !five_axis || model.rotary_mode == cnc_core::geometry::RotaryMode::Head {
+        return model.bounds;
+    }
+    let mut bounds = None::<(Point, Point)>;
+    for segment in &model.segments {
+        for point in [
+            model.rotary_mode.tip(segment.start, segment.start_rotation),
+            model.rotary_mode.tip(segment.end, segment.rotation),
+        ] {
+            let (min, max) = bounds.get_or_insert((point, point));
+            for i in 0..3 {
+                min[i] = min[i].min(point[i]);
+                max[i] = max[i].max(point[i]);
+            }
+        }
+    }
+    bounds.or(model.bounds)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
@@ -445,7 +465,7 @@ impl Plot {
     pub fn trail(&mut self, model: &Model, diameter: f64) -> Result<(), String> {
         let changed = self.trail.diameter() != diameter;
         self.trail
-            .load(&self.device, model, diameter, self.origin)?;
+            .load(&self.device, model, diameter, self.origin, self.five_axis)?;
         if changed {
             self.last_frame = None;
         }
@@ -470,7 +490,10 @@ impl Plot {
         })
     }
     pub fn partial_trail(&mut self, partial: Option<(&cnc_core::engine::Segment, usize, f64)>) {
-        if self.trail.partial(&self.queue, partial, self.origin) {
+        if self
+            .trail
+            .partial(&self.device, &self.queue, partial, self.origin)
+        {
             self.last_frame = None;
         }
     }
@@ -518,7 +541,7 @@ impl Plot {
             .first()
             .map(|s| {
                 if five_axis {
-                    cnc_core::geometry::rotate_point(s.start, s.start_rotation)
+                    model.rotary_mode.tip(s.start, s.start_rotation)
                 } else {
                     s.start
                 }
@@ -581,6 +604,7 @@ impl Plot {
 
         let mut vertices = Vec::with_capacity(model.segments.len() * 2);
         let mut depth_extent = 1_f64;
+        let mut slope_chain = 0;
         for (index, segment) in model.segments.iter().enumerate() {
             if index % 256 == 0 && cancelled() {
                 return Err("Plot cancelled".into());
@@ -591,15 +615,26 @@ impl Plot {
             ]
             .map(|(p, angles)| {
                 let p = if five_axis {
-                    cnc_core::geometry::rotate_point(p, angles)
+                    model.rotary_mode.tip(p, angles)
                 } else {
                     p
                 };
                 std::array::from_fn::<_, 3, _>(|i| p[i] - origin[i])
             });
+            if segment.rapid
+                || (crate::trail::slope(segment).abs() < 1e-6
+                    && (!five_axis
+                        || (segment.start_rotation == [0.; 3] && segment.rotation == [0.; 3])))
+            {
+                slope_chain = 0;
+            } else if slope_chain == 0
+                || !crate::trail::continues_slope(&model.segments[index - 1], segment)
+            {
+                slope_chain = index as u32 + 1;
+            }
             let detail = [
                 segment.tool_diameter.unwrap_or(0.) as f32,
-                0.,
+                slope_chain as f32,
                 (endpoints[1][2] - endpoints[0][2]) as f32,
             ];
             for relative in endpoints {
@@ -628,7 +663,9 @@ impl Plot {
         });
         let (trail, trail_error) = match diameter {
             Some(diameter) => {
-                match crate::trail::Trail::prepare(device, model, diameter, origin, cancel) {
+                match crate::trail::Trail::prepare(
+                    device, model, diameter, origin, five_axis, cancel,
+                ) {
                     Ok(data) => (Some(data), None),
                     Err(error) => (None, Some(error)),
                 }
@@ -708,6 +745,9 @@ impl Plot {
         relative.center = std::array::from_fn(|i| camera.center[i] - self.origin[i]);
         let relative_point = |point: Point| std::array::from_fn(|i| point[i] - self.origin[i]);
         let mut extent = self.depth_extent;
+        if trail {
+            extent += self.trail.radius();
+        }
         let mut live_vertices = LiveVertices::default();
         let mut to_relative = |point| {
             let point: Point = relative_point(point);
@@ -742,6 +782,9 @@ impl Plot {
         } else {
             0.
         };
+        if depth_support && sweep {
+            uniform[23] = self.trail.partial_owner(segments) as f32;
+        }
         let signature = (uniform, draw);
         if !changed && self.last_frame == Some(signature) {
             return false;
@@ -1542,14 +1585,24 @@ mod tests {
         depth_support: bool,
         name: &str,
     ) -> Vec<[u8; 4]> {
-        let mut plot = headless().unwrap();
         let model =
             cnc_core::engine::inspect(source, name, &Default::default(), &Default::default())
                 .unwrap();
+        depth_model(&model, camera, trail, depth_support, name)
+    }
+
+    fn depth_model(
+        model: &Model,
+        camera: &Camera,
+        trail: bool,
+        depth_support: bool,
+        name: &str,
+    ) -> Vec<[u8; 4]> {
+        let mut plot = headless().unwrap();
         assert_eq!(model.status, "complete");
-        plot.load(&model).unwrap();
+        plot.load(model).unwrap();
         if trail {
-            plot.trail(&model, 4.).unwrap();
+            plot.trail(model, 4.).unwrap();
         }
         plot.render(
             [96, 96],
@@ -1673,6 +1726,163 @@ mod tests {
             assert!(levels[0] > levels[1] && levels[1] > levels[2]);
             assert!(levels[2] > 2, "Fade at scale {scale}: {levels:?}");
             assert!(levels[3] <= 1, "Rear at scale {scale}: {levels:?}");
+        }
+    }
+
+    #[test]
+    fn vertical_bit_fills_ramps_and_plunges_in_side_view() {
+        let mut camera = Camera::default();
+        camera.center = [30., 20., 0.];
+        camera.scale = 0.25;
+        for view in ["front", "back"] {
+            camera.view(view);
+            for (name, start, end, center_x) in
+                [("ramp", 20, 40, 30. - 10. / 6.), ("plunge", 30, 30, 30.)]
+            {
+                let source = format!("G0 X{start} Y20 Z6\nG1 X{end} Z-6 F100\nM30\n");
+                let split =
+                    format!("G0 X{start} Y20 Z6\nG1 X{center_x} Z1 F100\nX{end} Z-6\nM30\n");
+                let sample = |image: &[[u8; 4]], x, z| {
+                    let [column, row] = camera.project([x, 20., z]);
+                    image[(row + 48.).floor() as usize * 96 + (column + 48.).floor() as usize]
+                };
+                for depth in [false, true] {
+                    let image = depth_fixture(&source, &camera, true, depth, name);
+                    let inside = sample(&image, center_x + 1.25, 1.);
+                    let outside = sample(&image, center_x + 2.75, 1.);
+                    assert!(inside[1] > inside[0] + 15, "{name} {view}: {inside:?}");
+                    assert_eq!(outside, [242, 242, 242, 255], "{name} {view}");
+                }
+                let one = depth_fixture(&source, &camera, true, true, "one-sweep");
+                let split = depth_fixture(&split, &camera, true, true, "split-sweep");
+                for z in [0.75, 1., 1.25] {
+                    let x = center_x + 1.25;
+                    assert_eq!(sample(&one, x, z), sample(&split, x, z), "{name} {view}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sloped_sweep_softly_mutes_the_cut_behind_it() {
+        let source = "G0 X20 Y20 Z-6\nG1 X40 F100\nG0 X30 Y15 Z8\nG1 Y25 Z3\nM30\n";
+        let mut camera = Camera::default();
+        camera.view("top");
+        camera.center = [30., 20., 0.];
+        camera.scale = 0.25;
+        let wires = depth_fixture(source, &camera, false, true, "ramp-wires");
+        let trail = depth_fixture(source, &camera, true, true, "ramp-sweep");
+        let strongest = |pixels: &[[u8; 4]], column: usize| {
+            (47..49)
+                .map(|row| pixels[row * 96 + column])
+                .min_by_key(|pixel| pixel[0])
+                .unwrap()
+        };
+        let rear = strongest(&trail, 42);
+        assert!(rear[0] >= strongest(&wires, 42)[0] + 45, "{rear:?}");
+        assert!(
+            rear[2] > rear[0] + 40,
+            "The rear blue line should remain visible: {rear:?}"
+        );
+        assert!(strongest(&trail, 34)[0] <= strongest(&wires, 34)[0] + 1);
+        let front = |pixels: &[[u8; 4]]| pixels[40 * 96 + 48][0].min(pixels[40 * 96 + 47][0]);
+        assert!(front(&trail) <= front(&wires) + 1);
+        let stripe = |column: usize| trail[44 * 96 + column][0];
+        assert!(stripe(39) > stripe(37) && stripe(37) > stripe(35));
+    }
+
+    #[test]
+    fn subdivided_plunge_keeps_its_centreline_in_an_oblique_view() {
+        use std::fmt::Write;
+        let mut source = String::from("G0 X30 Y20 Z12\nG1 F100\n");
+        for z in (-12..12).rev() {
+            writeln!(source, "Z{z}").unwrap();
+        }
+        source.push_str("M30\n");
+        let mut camera = Camera::default();
+        camera.center = [30., 20., 0.];
+        camera.scale = 0.125;
+        for z in [1., -1.] {
+            camera.view_direction([0., -0.25, z]);
+            let wires = depth_fixture(&source, &camera, false, true, "plunge-wire");
+            let trail = depth_fixture(&source, &camera, true, true, "plunge-trail");
+            let mut compared = 0;
+            for (wire, trail) in wires.iter().zip(&trail) {
+                if wire[2] > 200 && wire[0] < 130 {
+                    assert!(trail[0] <= wire[0] + 15, "{wire:?} -> {trail:?}");
+                    compared += 1;
+                }
+            }
+            assert!(compared > 20);
+        }
+    }
+
+    #[test]
+    fn a_tilted_head_sweeps_the_end_disc_including_rotation_at_a_fixed_tip() {
+        let tilted = |source| {
+            cnc_core::engine::inspect(
+                source,
+                "head.nc",
+                &Default::default(),
+                &cnc_core::engine::Options {
+                    setup: serde_json::json!({"axisRoles":{"B":"rotary"},"rotaryMode":"head"}),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let mut camera = Camera::default();
+        camera.view("front");
+        camera.center = [30., 20., 5.];
+        camera.scale = 0.075;
+        let pixel = |image: &[[u8; 4]], point| {
+            let [x, y] = camera.project(point);
+            image[(y + 48.).floor() as usize * 96 + (x + 48.).floor() as usize]
+        };
+        let green = |pixel: [u8; 4]| pixel[1].saturating_sub(pixel[0]) > 12;
+        let fixed = tilted("G0 X27 Y20 Z5 B90\nG1 X33 F100\nM30\n");
+        let image = depth_model(&fixed, &camera, true, true, "fixed-tilt");
+        assert!(green(pixel(&image, [30., 20., 6.7])));
+        assert!(!green(pixel(&image, [30., 20., 7.2])));
+        let wire = pixel(&image, [29., 20., 5.]);
+        assert!(wire[2] > 225 && wire[0] < 130, "{wire:?}");
+
+        let quarter = tilted("G0 X30 Y20 Z5\nG1 B90 F100\nM30\n");
+        let image = depth_model(&quarter, &camera, true, true, "pure-quarter-tilt");
+        assert!(green(pixel(&image, [31.1, 20., 6.1])));
+        assert!(!green(pixel(&image, [31.1, 20., 3.9])));
+        let turn = tilted("G0 X30 Y20 Z5\nG1 B360 F100\nM30\n");
+        let image = depth_model(&turn, &camera, true, true, "full-turn-tilt");
+        assert!(green(pixel(&image, [31.1, 20., 3.9])));
+        assert!(!green(pixel(&image, [31.6, 20., 6.6])));
+    }
+
+    #[test]
+    fn a_rotary_table_sweeps_around_the_pivot_while_a_spinning_head_keeps_its_tip() {
+        let program = "G0 X30 Y0 Z5\nG1 C90 F100\nM30\n";
+        let p = 30.0 / 2_f64.sqrt();
+        let mut camera = Camera::default();
+        camera.view("top");
+        camera.center = [p + 1., p + 1., 5.];
+        camera.scale = 0.15;
+        for mode in ["table", "head"] {
+            let model = cnc_core::engine::inspect(
+                program,
+                "rotary.nc",
+                &Default::default(),
+                &cnc_core::engine::Options {
+                    setup: serde_json::json!({"axisRoles":{"C":"rotary"},"rotaryMode":mode}),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let image = depth_model(&model, &camera, true, true, mode);
+            let pixel = image[48 * 96 + 48];
+            assert_eq!(
+                pixel[1].saturating_sub(pixel[0]) > 12,
+                mode == "table",
+                "{mode}: {pixel:?}"
+            );
         }
     }
 

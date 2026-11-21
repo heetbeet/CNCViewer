@@ -201,6 +201,14 @@ with tempfile.TemporaryDirectory(prefix='CNC native release ') as temporary:
                             'target': {'z': -1}}}, 2)
     assert report['firstFailure']['check'] == 'stockRemaining'
     assert report['firstFailure']['point'][2] == 0
+    tilted = root / 'tilted.nc'
+    tilted.write_text('G21 G90\nG0 X20 Y10 Z5 B30\nG1 X30 B80 F100\nM30\n')
+    tilted_setup = {'axisRoles': {'B': 'rotary'}, 'rotaryMode': 'head'}
+    report = run({'setup': tilted_setup, 'output': 'tilt',
+                  'views': [{'name': 'tilt', 'angle': 'front', 'cutter': {'diameter': 4},
+                             'depthSupport': True}]}, 0, tilted)
+    assert report['status'] == 'complete' and report['summary']['end'] == [30, 10, 5]
+    assert (root / 'tilt/tilt.png').read_bytes().startswith(b'\x89PNG')
     alarm = root / 'alarm.nc'
     alarm.write_text('#3000=1 (Stop)\nM30\n')
     report = run({'cutter': {'diameter': 2},

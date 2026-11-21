@@ -495,9 +495,18 @@ fn sweep_for(s: &Segment, i: usize, cutter: &Value) -> Result<Sweep> {
     {
         return Err(NcError::new("Cutter sweeps require a vertical tool"));
     }
+    Ok(Sweep {
+        start: s.start,
+        end: s.end,
+        diameter: cutter_diameter(s, cutter)?,
+        witness: i,
+    })
+}
+
+pub fn cutter_diameter(s: &Segment, cutter: &Value) -> Result<f64> {
     let tool = &cutter["tools"][s.tool.to_string()]["diameter"];
     let default = &cutter["diameter"];
-    let diameter = if !tool.is_null() {
+    if !tool.is_null() {
         tool.as_f64()
     } else if !default.is_null() {
         default.as_f64()
@@ -505,13 +514,7 @@ fn sweep_for(s: &Segment, i: usize, cutter: &Value) -> Result<Sweep> {
         s.tool_diameter
     }
     .filter(|d| d.is_finite() && *d > 0. && *d <= 10000.)
-    .ok_or_else(|| NcError::new(format!("Supply a positive diameter for tool {}", s.tool)))?;
-    Ok(Sweep {
-        start: s.start,
-        end: s.end,
-        diameter,
-        witness: i,
-    })
+    .ok_or_else(|| NcError::new(format!("Supply a positive diameter for tool {}", s.tool)))
 }
 pub fn stock(model: &Model, job: &Value) -> Result<Value> {
     stock_report(model, job, true)
