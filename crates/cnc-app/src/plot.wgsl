@@ -12,7 +12,7 @@ const RAPID_COLOR = vec3<f32>(251.0, 140.0, 0.0) / 255.0;
 const RAPID_ALPHA: f32 = 166.0 / 255.0;
 const TRAIL_COLOR = vec3<f32>(0.2784, 0.6314, 0.5176);
 const TRAIL_ALPHA: f32 = 0.28;
-const SWEEP_ALPHA: f32 = 0.48;
+const SWEEP_ALPHA: f32 = 0.62;
 const AXIS_FIRST = 0xfffffcu;
 const LIVE_SEGMENT = 0xffffffu;
 const HALO_RADIUS = 5.75;
@@ -170,14 +170,6 @@ fn read_sweep(pixel: vec2<i32>, index: i32, ignore: u32) -> Sweep {
 }
 
 fn is_line(wire: Wire) -> bool { return wire.tag < 192u; }
-fn planar(wire: Wire) -> bool { return (wire.tag & 32u) != 0u; }
-
-fn depth_gap(near: f32, far: f32, offset: vec2<f32>, same_plane_basis: bool) -> f32 {
-    let gradient = camera.xy_depth.xy * camera.xy_depth.z;
-    // Translate the neighboring depth to the receiver's pixel on a horizontal plane.
-    let correction = select(0.0, dot(gradient, offset * vec2(1.0, -1.0)), same_plane_basis);
-    return far - near + correction - max(0.000001, 0.8 * length(gradient));
-}
 
 fn path_vertex(owner: u32, end: u32) -> PathVertex {
     if owner == LIVE_SEGMENT { return live_path[end]; }
@@ -274,28 +266,38 @@ struct HaloVertex {
     return wire_halo(near, far, dot(at - far.start.xy, far.direction));
 }
 
-fn sweep_separation(surface: Sweep, far: f32, offset: vec2<f32>, horizontal: bool) -> f32 {
+fn sweep_separation(surface: Sweep, far: f32, correction: f32) -> f32 {
+    let gap = far - surface.depth + select(0.0, correction, surface.planar);
+    if gap <= 0.0 { return 0.0; }
     var diameter = camera.depth_scale.y;
     if surface.owner < AXIS_FIRST {
         let programmed = path[(surface.owner - 1u) * 2u].diameter;
         if programmed > 0.0 { diameter = programmed * camera.depth_scale.z; }
     }
-    let gap = depth_gap(surface.depth, far, offset, surface.planar && horizontal);
     // Nearby parts of the same-size footprint should stay readable. A visibly
     // separated upper pass can dim a lower path regardless of how it was programmed.
     return smoothstep(diameter * 1.08, max(diameter * 1.22, 0.000001), gap);
 }
 
-const NEIGHBORS = array<vec2<i32>, 16>(
-    vec2(1, 0), vec2(-1, 0), vec2(0, 1), vec2(0, -1),
-    vec2(1, 1), vec2(-1, -1), vec2(1, -1), vec2(-1, 1),
-    vec2(2, 0), vec2(-2, 0), vec2(0, 2), vec2(0, -2),
-    vec2(2, 2), vec2(-2, -2), vec2(2, -2), vec2(-2, 2),
+// Screen-point offsets with Gaussian weights. Only closer sweep coverage
+// contributes, so the edge softens into the rear pass at an overlap.
+const SWEEP_TAPS = array<vec3<f32>, 12>(
+    vec3(1.0, 0.0, 0.25), vec3(-1.0, 0.0, 0.25), vec3(0.0, 1.0, 0.25), vec3(0.0, -1.0, 0.25),
+    vec3(2.0, 2.0, 0.14), vec3(-2.0, -2.0, 0.14), vec3(2.0, -2.0, 0.14), vec3(-2.0, 2.0, 0.14),
+    vec3(4.0, 0.0, 0.08), vec3(-4.0, 0.0, 0.08), vec3(0.0, 4.0, 0.08), vec3(0.0, -4.0, 0.08),
 );
+
+fn sweep_coverage(pixel: vec2<i32>, index: i32, owner: u32, far: f32, correction: f32) -> f32 {
+    let edge = read_sweep(pixel, index, owner);
+    if edge.owner == 0u { return 0.0; }
+    return sweep_separation(edge, far, correction);
+}
 
 @fragment fn fs_resolve(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(position.xy);
     let show_sweep = camera.flags.w >= 2.0;
+    let gradient = camera.xy_depth.xy * vec2(1.0, -1.0) * camera.xy_depth.z;
+    let depth_bias = max(0.000001, 0.8 * length(gradient));
     let no_sweep = Sweep(0u, false, 1.0);
     var wire: array<Wire, 4>;
     var sweep: array<Sweep, 4>;
@@ -318,24 +320,33 @@ const NEIGHBORS = array<vec2<i32>, 16>(
     var sweep_edge = 0.0;
     if front_sweep.owner != 0u {
         let limit = vec2<i32>(textureDimensions(wires)) - vec2(1);
-        let stride = max(1, i32(round(1.0 / camera.xy_depth.z)));
-        for (var n = 0; n < 16; n++) {
-            let neighbor = clamp(pixel + NEIGHBORS[n] * stride, vec2(0), limit);
+        let dpi = 1.0 / camera.xy_depth.z;
+        let far = front_sweep.depth - depth_bias;
+        for (var n = 0; n < 12; n++) {
+            let tap = SWEEP_TAPS[n];
+            let neighbor = clamp(pixel + vec2<i32>(round(tap.xy * dpi)), vec2(0), limit);
             let offset = vec2<f32>(neighbor - pixel);
-            let distance = length(offset) * camera.xy_depth.z;
-            if distance <= 2.5 {
-                for (var i = 0; i < 4; i++) {
-                    let edge = read_sweep(neighbor, i, front_sweep.owner);
-                    if edge.owner == 0u { continue; }
-                    let strength = 1.0 - smoothstep(0.85, 2.5, distance);
-                    let separation = sweep_separation(edge, front_sweep.depth, offset, front_sweep.planar);
-                    sweep_edge = max(sweep_edge, strength * 0.75 * separation);
-                }
+            // Project a horizontal sweep's depth to the receiver's pixel.
+            let correction = select(0.0, dot(gradient, offset), front_sweep.planar);
+            // The faint outer tail uses one sample, mirrored on opposing taps.
+            if n >= 8 {
+                sweep_edge += tap.z * sweep_coverage(neighbor, (n % 2) * 3, front_sweep.owner, far, correction);
+                continue;
             }
+            var cover = sweep_coverage(neighbor, 0, front_sweep.owner, far, correction)
+                + sweep_coverage(neighbor, 3, front_sweep.owner, far, correction);
+            // Keep full MSAA at the boundary.
+            if n < 4 {
+                cover = (cover + sweep_coverage(neighbor, 1, front_sweep.owner, far, correction)
+                    + sweep_coverage(neighbor, 2, front_sweep.owner, far, correction)) * 0.5;
+            }
+            sweep_edge += cover * (0.5 * tap.z);
         }
+        sweep_edge = min(0.7, sweep_edge);
     }
 
     var color = vec3(0.0);
+    // Match the trail on the canvas while increasing its opacity over rear wires.
     let pigment = mix(CANVAS, TRAIL_COLOR, TRAIL_ALPHA / SWEEP_ALPHA);
     for (var i = 0; i < 4; i++) {
         let line = wire[i];
@@ -350,7 +361,7 @@ const NEIGHBORS = array<vec2<i32>, 16>(
         }
         var ink = line.color;
         if surface.owner != 0u && surface.owner != line.owner {
-            let separation = sweep_separation(surface, line.depth, vec2(0.0), planar(line));
+            let separation = sweep_separation(surface, line.depth - depth_bias, 0.0);
             ink = mix(ink, pigment, SWEEP_ALPHA * separation);
         }
         let gap = select(0.0, textureLoad(halos, pixel, i).r, is_line(line));

@@ -1660,19 +1660,20 @@ mod tests {
         let mut camera = Camera::default();
         camera.view("top");
         camera.center = [30., 20., 3.];
-        camera.scale = 0.25;
-        let flat = depth_fixture(source, &camera, true, false, "sweep-edge");
-        let depth = depth_fixture(source, &camera, true, true, "sweep-edge");
-        let edge = 44 * 96 + 39;
-        let rear = 44 * 96 + 35;
-        assert_eq!(flat[edge], flat[rear]);
-        assert!(
-            depth[edge][0] >= depth[rear][0] + 20,
-            "edge {:?}, rear {:?}",
-            depth[edge],
-            depth[rear]
-        );
-        assert!(flat[rear][0].abs_diff(depth[rear][0]) <= 1);
+        for (scale, edge) in [(0.25, 40_usize), (0.125, 32)] {
+            camera.scale = scale;
+            let flat = depth_fixture(source, &camera, true, false, "sweep-edge");
+            let depth = depth_fixture(source, &camera, true, true, "sweep-edge");
+            let lift = |distance| {
+                let i: usize = 44 * 96 + edge - distance;
+                depth[i][0].saturating_sub(flat[i][0])
+            };
+            let levels = [lift(1), lift(2), lift(3), lift(5)];
+            assert!(levels[0] >= 20, "Edge at scale {scale}: {levels:?}");
+            assert!(levels[0] > levels[1] && levels[1] > levels[2]);
+            assert!(levels[2] > 2, "Fade at scale {scale}: {levels:?}");
+            assert!(levels[3] <= 1, "Rear at scale {scale}: {levels:?}");
+        }
     }
 
     #[test]
@@ -1720,9 +1721,10 @@ mod tests {
             red(44) > red(34) + 50,
             "near sweep should mute the earlier cut"
         );
+        let occluded = red(44);
         assert!(
-            red(44) < 170,
-            "the earlier cut should stay visible through it"
+            (95..170).contains(&occluded),
+            "The earlier cut should be muted but visible: {occluded}"
         );
     }
 
