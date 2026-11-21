@@ -581,6 +581,7 @@ impl Plot {
 
         let mut vertices = Vec::with_capacity(model.segments.len() * 2);
         let mut depth_extent = 1_f64;
+        let mut slope_chain = 0;
         for (index, segment) in model.segments.iter().enumerate() {
             if index % 256 == 0 && cancelled() {
                 return Err("Plot cancelled".into());
@@ -597,9 +598,16 @@ impl Plot {
                 };
                 std::array::from_fn::<_, 3, _>(|i| p[i] - origin[i])
             });
+            if segment.rapid || crate::trail::slope(segment).abs() < 1e-6 {
+                slope_chain = 0;
+            } else if slope_chain == 0
+                || !crate::trail::continues_slope(&model.segments[index - 1], segment)
+            {
+                slope_chain = index as u32 + 1;
+            }
             let detail = [
                 segment.tool_diameter.unwrap_or(0.) as f32,
-                0.,
+                slope_chain as f32,
                 (endpoints[1][2] - endpoints[0][2]) as f32,
             ];
             for relative in endpoints {
@@ -742,6 +750,9 @@ impl Plot {
         } else {
             0.
         };
+        if depth_support && sweep {
+            uniform[23] = self.trail.partial_owner(segments) as f32;
+        }
         let signature = (uniform, draw);
         if !changed && self.last_frame == Some(signature) {
             return false;
@@ -1673,6 +1684,94 @@ mod tests {
             assert!(levels[0] > levels[1] && levels[1] > levels[2]);
             assert!(levels[2] > 2, "Fade at scale {scale}: {levels:?}");
             assert!(levels[3] <= 1, "Rear at scale {scale}: {levels:?}");
+        }
+    }
+
+    #[test]
+    fn vertical_bit_fills_ramps_and_plunges_in_side_view() {
+        let mut camera = Camera::default();
+        camera.center = [30., 20., 0.];
+        camera.scale = 0.25;
+        for view in ["front", "back"] {
+            camera.view(view);
+            for (name, start, end, center_x) in
+                [("ramp", 20, 40, 30. - 10. / 6.), ("plunge", 30, 30, 30.)]
+            {
+                let source = format!("G0 X{start} Y20 Z6\nG1 X{end} Z-6 F100\nM30\n");
+                let split =
+                    format!("G0 X{start} Y20 Z6\nG1 X{center_x} Z1 F100\nX{end} Z-6\nM30\n");
+                let sample = |image: &[[u8; 4]], x, z| {
+                    let [column, row] = camera.project([x, 20., z]);
+                    image[(row + 48.).floor() as usize * 96 + (column + 48.).floor() as usize]
+                };
+                for depth in [false, true] {
+                    let image = depth_fixture(&source, &camera, true, depth, name);
+                    let inside = sample(&image, center_x + 1.25, 1.);
+                    let outside = sample(&image, center_x + 2.75, 1.);
+                    assert!(inside[1] > inside[0] + 15, "{name} {view}: {inside:?}");
+                    assert_eq!(outside, [242, 242, 242, 255], "{name} {view}");
+                }
+                let one = depth_fixture(&source, &camera, true, true, "one-sweep");
+                let split = depth_fixture(&split, &camera, true, true, "split-sweep");
+                for z in [0.75, 1., 1.25] {
+                    let x = center_x + 1.25;
+                    assert_eq!(sample(&one, x, z), sample(&split, x, z), "{name} {view}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sloped_sweep_softly_mutes_the_cut_behind_it() {
+        let source = "G0 X20 Y20 Z-6\nG1 X40 F100\nG0 X30 Y15 Z8\nG1 Y25 Z3\nM30\n";
+        let mut camera = Camera::default();
+        camera.view("top");
+        camera.center = [30., 20., 0.];
+        camera.scale = 0.25;
+        let wires = depth_fixture(source, &camera, false, true, "ramp-wires");
+        let trail = depth_fixture(source, &camera, true, true, "ramp-sweep");
+        let strongest = |pixels: &[[u8; 4]], column: usize| {
+            (47..49)
+                .map(|row| pixels[row * 96 + column])
+                .min_by_key(|pixel| pixel[0])
+                .unwrap()
+        };
+        let rear = strongest(&trail, 42);
+        assert!(rear[0] >= strongest(&wires, 42)[0] + 45, "{rear:?}");
+        assert!(
+            rear[2] > rear[0] + 40,
+            "The rear blue line should remain visible: {rear:?}"
+        );
+        assert!(strongest(&trail, 34)[0] <= strongest(&wires, 34)[0] + 1);
+        let front = |pixels: &[[u8; 4]]| pixels[40 * 96 + 48][0].min(pixels[40 * 96 + 47][0]);
+        assert!(front(&trail) <= front(&wires) + 1);
+        let stripe = |column: usize| trail[44 * 96 + column][0];
+        assert!(stripe(39) > stripe(37) && stripe(37) > stripe(35));
+    }
+
+    #[test]
+    fn subdivided_plunge_keeps_its_centreline_in_an_oblique_view() {
+        use std::fmt::Write;
+        let mut source = String::from("G0 X30 Y20 Z12\nG1 F100\n");
+        for z in (-12..12).rev() {
+            writeln!(source, "Z{z}").unwrap();
+        }
+        source.push_str("M30\n");
+        let mut camera = Camera::default();
+        camera.center = [30., 20., 0.];
+        camera.scale = 0.125;
+        for z in [1., -1.] {
+            camera.view_direction([0., -0.25, z]);
+            let wires = depth_fixture(&source, &camera, false, true, "plunge-wire");
+            let trail = depth_fixture(&source, &camera, true, true, "plunge-trail");
+            let mut compared = 0;
+            for (wire, trail) in wires.iter().zip(&trail) {
+                if wire[2] > 200 && wire[0] < 130 {
+                    assert!(trail[0] <= wire[0] + 15, "{wire:?} -> {trail:?}");
+                    compared += 1;
+                }
+            }
+            assert!(compared > 20);
         }
     }
 

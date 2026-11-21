@@ -1,4 +1,3 @@
-use crate::render::LIVE_SEGMENT;
 use cnc_core::engine::{Model, Segment};
 use cnc_core::geometry::{interpolate, Point};
 use eframe::wgpu::{self, util::DeviceExt};
@@ -11,7 +10,42 @@ struct SweepVertex {
     owner: u32,
 }
 
-type SweepRange = (usize, u32, u32);
+const RIM_POINTS: usize = 24;
+const MAX_SWEEP_VERTICES: usize = (4 * RIM_POINTS - 4) * 3;
+const PLANAR: u32 = 1 << 24;
+const VOLUME: u32 = 1 << 25;
+const JOINS_PREVIOUS: u32 = 1 << 26;
+const JOINS_NEXT: u32 = 1 << 27;
+
+pub(crate) fn slope(segment: &Segment) -> f64 {
+    segment.end[2] - segment.start[2]
+}
+
+fn connected(before: &Segment, after: &Segment, fallback: Option<f64>) -> bool {
+    !before.rapid
+        && !after.rapid
+        && before.end == after.start
+        && before.tool == after.tool
+        && before.tool_diameter.or(fallback) == after.tool_diameter.or(fallback)
+}
+
+pub(crate) fn continues_slope(before: &Segment, after: &Segment) -> bool {
+    connected(before, after, None)
+        && slope(before).signum() == slope(after).signum()
+        && (0..2).all(|axis| {
+            let a = (before.end[axis] - before.start[axis]) * slope(after);
+            let b = (after.end[axis] - after.start[axis]) * slope(before);
+            (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0)
+        })
+}
+
+#[derive(Clone, Copy)]
+struct SweepRange {
+    step: usize,
+    brush: u32,
+    end: u32,
+    joins: u32,
+}
 
 #[derive(Clone)]
 pub struct PreparedTrail {
@@ -104,7 +138,8 @@ impl Trail {
                     module: shader,
                     entry_point: Some(match kind {
                         Pass::Finish => "vs_quad",
-                        Pass::Paint | Pass::Surface => "vs_sweep",
+                        Pass::Paint => "vs_trail",
+                        Pass::Surface => "vs_sweep",
                     }),
                     compilation_options: Default::default(),
                     buffers: if finish { &[] } else { &buffers },
@@ -167,7 +202,7 @@ impl Trail {
             partial: None,
             partial_vertices: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Partial cutter sweep"),
-                size: 150 * 16,
+                size: (MAX_SWEEP_VERTICES * size_of::<SweepVertex>()) as u64,
                 mapped_at_creation: false,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             }),
@@ -224,9 +259,7 @@ impl Trail {
         }
         let mut ranges = Vec::new();
         let mut vertices = Vec::new();
-        let mut previous = None;
         let mut brush_start = 0;
-        let mut prior_index = 0;
         for (index, segment) in model.segments.iter().enumerate() {
             if index % 256 == 0
                 && cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
@@ -234,7 +267,6 @@ impl Trail {
                 return Err("Plot cancelled".into());
             }
             if segment.rapid {
-                previous = None;
                 continue;
             }
             let d = segment.tool_diameter.unwrap_or(diameter);
@@ -242,26 +274,30 @@ impl Trail {
             if !radius.is_finite() || radius <= 0. {
                 continue;
             }
-            let connected = previous.is_some_and(|(end, tool, old_d)| {
-                prior_index + 1 == index
-                    && end == segment.start
-                    && tool == segment.tool
-                    && old_d == d
-            });
-            if !connected {
+            let previous =
+                index > 0 && connected(&model.segments[index - 1], segment, Some(diameter));
+            let next = model
+                .segments
+                .get(index + 1)
+                .is_some_and(|next| connected(segment, next, Some(diameter)));
+            if !previous {
                 brush_start = vertices.len() as u32;
             }
-            capsule(
+            let joins = (u32::from(previous) * JOINS_PREVIOUS) | (u32::from(next) * JOINS_NEXT);
+            sweep_mesh(
                 &mut vertices,
                 segment.start,
                 segment.end,
                 radius,
                 origin,
-                index as u32 + 1,
+                (index as u32 + 1) | joins,
             );
-            ranges.push((index + 1, brush_start, vertices.len() as u32));
-            previous = Some((segment.end, segment.tool, d));
-            prior_index = index;
+            ranges.push(SweepRange {
+                step: index + 1,
+                brush: brush_start,
+                end: vertices.len() as u32,
+                joins,
+            });
         }
         if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
             return Err("Plot cancelled".into());
@@ -302,26 +338,31 @@ impl Trail {
             }
             let range = self
                 .ranges
-                .binary_search_by_key(&(index + 1), |range| range.0)
+                .binary_search_by_key(&(index + 1), |range| range.step)
                 .ok()
                 .map(|position| self.ranges[position]);
-            if let Some((_, brush, _)) = range {
-                let mut vertices = Vec::with_capacity(150);
+            if let Some(range) = range {
+                let mut vertices = Vec::with_capacity(MAX_SWEEP_VERTICES);
                 let end = interpolate(segment.start, segment.end, fraction);
-                capsule(
+                sweep_mesh(
                     &mut vertices,
                     segment.start,
                     end,
                     segment.tool_diameter.unwrap_or(self.diameter) / 2.,
                     origin,
-                    LIVE_SEGMENT,
+                    (index as u32 + 1) | range.joins,
                 );
                 queue.write_buffer(&self.partial_vertices, 0, bytemuck::cast_slice(&vertices));
-                self.partial = Some((index, fraction, brush, vertices.len() as u32));
+                self.partial = Some((index, fraction, range.brush, vertices.len() as u32));
                 return true;
             }
         }
         self.partial.take().is_some()
+    }
+    pub fn partial_owner(&self, segments: usize) -> u32 {
+        self.partial
+            .filter(|(index, _, _, _)| *index == segments)
+            .map_or(0, |(index, _, _, _)| index as u32 + 1)
     }
     fn paint(
         &self,
@@ -344,13 +385,15 @@ impl Trail {
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, segments: usize) {
         let mut i = 0;
         let mut partial = self.partial.filter(|(index, _, _, _)| *index == segments);
-        while i < self.ranges.len() && self.ranges[i].0 <= segments {
-            let start = self.ranges[i].1;
-            let mut end = self.ranges[i].2;
+        while i < self.ranges.len() && self.ranges[i].step <= segments {
+            let start = self.ranges[i].brush;
+            let mut end = self.ranges[i].end;
             i += 1;
-            while i < self.ranges.len() && self.ranges[i].1 == start && self.ranges[i].0 <= segments
+            while i < self.ranges.len()
+                && self.ranges[i].brush == start
+                && self.ranges[i].step <= segments
             {
-                end = self.ranges[i].2;
+                end = self.ranges[i].end;
                 i += 1;
             }
             self.paint(pass, &self.vertices, start..end);
@@ -369,7 +412,7 @@ impl Trail {
     }
 
     pub fn draw_depth_supported(&self, pass: &mut wgpu::RenderPass<'_>, segments: usize) {
-        let completed = self.ranges.partition_point(|range| range.0 <= segments);
+        let completed = self.ranges.partition_point(|range| range.step <= segments);
         let partial = self.partial.filter(|(index, _, _, _)| *index == segments);
         if completed == 0 && partial.is_none() {
             return;
@@ -378,7 +421,7 @@ impl Trail {
         pass.set_bind_group(0, &self.surface_bind, &[]);
         if let Some(completed) = completed.checked_sub(1) {
             pass.set_vertex_buffer(0, self.vertices.slice(..));
-            pass.draw(0..self.ranges[completed].2, 0..1);
+            pass.draw(0..self.ranges[completed].end, 0..1);
         }
         if let Some((_, _, _, count)) = partial {
             pass.set_vertex_buffer(0, self.partial_vertices.slice(..));
@@ -387,7 +430,7 @@ impl Trail {
     }
 }
 
-fn capsule(
+fn sweep_mesh(
     vertices: &mut Vec<SweepVertex>,
     a: Point,
     b: Point,
@@ -397,38 +440,67 @@ fn capsule(
 ) {
     let unit_circle = std::sync::OnceLock::get_or_init(&UNIT_CIRCLE, || {
         std::array::from_fn(|i| {
-            let angle = i as f64 * std::f64::consts::TAU / 24.;
+            let angle = i as f64 * std::f64::consts::TAU / RIM_POINTS as f64;
             [angle.cos(), angle.sin()]
         })
     });
-    let owner = owner | (u32::from((a[2] - b[2]).abs() < 1e-6) << 24);
-    let mut triangle = |a, b, c| {
+    let mut triangle = |a, b, c, flags| {
         for p in [a, b, c] {
             let p: Point = p;
             vertices.push(SweepVertex {
                 point: std::array::from_fn(|i| (p[i] - origin[i]) as f32),
-                owner,
+                owner: owner | flags,
             });
         }
     };
+    if (a[2] - b[2]).abs() >= 1e-6 {
+        // A horizontal disc translated along the move has two horizontal caps
+        // and a ruled side between corresponding points on its rims.
+        let rim = |center: Point| {
+            unit_circle.map(|[x, y]| [center[0] + radius * x, center[1] + radius * y, center[2]])
+        };
+        let [start, end] = [rim(a), rim(b)];
+        for i in 1..RIM_POINTS - 1 {
+            triangle(start[0], start[i], start[i + 1], VOLUME | PLANAR);
+            triangle(end[0], end[i], end[i + 1], VOLUME | PLANAR);
+        }
+        for i in 0..RIM_POINTS {
+            let j = (i + 1) % RIM_POINTS;
+            triangle(start[i], start[j], end[i], VOLUME);
+            triangle(end[i], start[j], end[j], VOLUME);
+        }
+        return;
+    }
     let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
     let length = dx.hypot(dy);
-    if length > 0. {
-        let x = -dy / length * radius;
-        let y = dx / length * radius;
-        let al = [a[0] + x, a[1] + y, a[2]];
-        let ar = [a[0] - x, a[1] - y, a[2]];
-        let bl = [b[0] + x, b[1] + y, b[2]];
-        let br = [b[0] - x, b[1] - y, b[2]];
-        triangle(al, ar, bl);
-        triangle(bl, ar, br);
+    if length == 0. {
+        let rim = unit_circle.map(|[x, y]| [a[0] + radius * x, a[1] + radius * y, a[2]]);
+        for i in 1..RIM_POINTS - 1 {
+            triangle(rim[0], rim[i], rim[i + 1], PLANAR);
+        }
+        return;
     }
-    for center in [a, b] {
-        let point = |[x, y]: [f64; 2]| [center[0] + radius * x, center[1] + radius * y, center[2]];
-        for (i, start) in unit_circle.iter().enumerate() {
-            triangle(center, point(*start), point(unit_circle[(i + 1) % 24]));
+
+    // Flat moves need only the outer capsule, with no overdraw at its caps.
+    let (x, y) = (dx * radius / length, dy * radius / length);
+    let rim = |center: Point, index: usize| {
+        let [cos, sin] = unit_circle[index % RIM_POINTS];
+        [
+            center[0] + cos * x - sin * y,
+            center[1] + cos * y + sin * x,
+            center[2],
+        ]
+    };
+    let left = RIM_POINTS / 4;
+    let right = 3 * left;
+    let (al, ar, bl, br) = (rim(a, left), rim(a, right), rim(b, left), rim(b, right));
+    triangle(al, ar, bl, PLANAR);
+    triangle(bl, ar, br, PLANAR);
+    for (center, start) in [(a, left), (b, right)] {
+        for i in start..start + RIM_POINTS / 2 {
+            triangle(center, rim(center, i), rim(center, i + 1), PLANAR);
         }
     }
 }
 
-static UNIT_CIRCLE: std::sync::OnceLock<[[f64; 2]; 24]> = std::sync::OnceLock::new();
+static UNIT_CIRCLE: std::sync::OnceLock<[[f64; 2]; RIM_POINTS]> = std::sync::OnceLock::new();

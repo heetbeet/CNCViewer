@@ -9,7 +9,7 @@ I built CNC Viewer in Rust for Windows with GPT-6.2 Astra and Sol. It supports t
 ## Features
 
 - Interactive 3D backplot.
-- Cutter trails that show the width of a configured bit, with optional depth cues.
+- Cutter trails that show the width of a configured bit, including the volume swept by a vertical flat-end bit on ramps and plunges, with optional depth cues.
 - FANUC-style Macro B variables, expressions, loops, branches, and subprograms.
 - Execution slider that follows repeated blocks.
 - Variable viewer that updates as execution progresses.

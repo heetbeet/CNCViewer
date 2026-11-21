@@ -13,7 +13,7 @@ Pass a JSON file as the second argument to `inspect FILE JOB.json`. Library and 
 }
 ```
 
-Set `"depthSupport": true` in a PNG view to show halos at depth crossings and mute lines beneath the cutter trail.
+Set `"depthSupport": true` in a PNG view to show halos at depth crossings and mute lines beneath the cutter trail. For a vertical flat-end cutter, the trail shows the volume swept by the end disc on ramps and plunges. Use a stock section to measure the resulting surface.
 
 Set `setup.initialPosition` and `setup.workOffsets` when the program relies on a known start or fixture zero. For example, `"setup":{"initialPosition":[100,40,25],"workOffsets":{"55":[100,40,20]}}` puts the tool tip 5 mm above the G55 origin. Report coordinates and check targets use machine tool-tip XYZ, so convert expected work coordinates using the supplied offset. Use `setup.variables` for initial macro values and `setup.tools` for numbered tool data. Follow the report's `requirements` for any other machine inputs.
 

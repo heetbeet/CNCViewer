@@ -16,6 +16,11 @@ const SWEEP_ALPHA: f32 = 0.62;
 const AXIS_FIRST = 0xfffffcu;
 const LIVE_SEGMENT = 0xffffffu;
 const HALO_RADIUS = 5.75;
+// Matches the flags packed into the upper byte of SweepVertex.owner.
+const SWEEP_PLANAR = 1u;
+const SWEEP_VOLUME = 2u;
+const SWEEP_PREVIOUS = 4u;
+const SWEEP_NEXT = 8u;
 
 struct Out {
     @builtin(position) position: vec4<f32>,
@@ -85,12 +90,20 @@ fn fullscreen(index: u32) -> vec4<f32> {
     return Out(vec4(to_clip(p), 1.0), vec4(0.0), owner, 0u);
 }
 
+@vertex fn vs_trail(@location(0) p: vec3<f32>, @location(1) owner: u32) -> Out {
+    var clip = to_clip(p);
+    // Paint the volume silhouette behind the wires in the flat brush pass.
+    // Its actual depth is used by the depth-support pass.
+    if ((owner >> 24u) & SWEEP_VOLUME) != 0u { clip.z = 0.999999; }
+    return Out(vec4(clip, 1.0), vec4(0.0), owner, 0u);
+}
+
 @fragment fn fs_trail(input: Out) -> @location(0) vec4<f32> {
     return vec4(TRAIL_COLOR, TRAIL_ALPHA + input.color.w * 0.000001);
 }
 
 @fragment fn fs_sweep(input: Out) -> @location(0) vec4<f32> {
-    return vec4(encode_owner(input.owner), f32(input.owner >> 24u));
+    return vec4(encode_owner(input.owner), f32(input.owner >> 24u) / 255.0);
 }
 
 @vertex fn vs_point(
@@ -119,7 +132,7 @@ struct PathVertex {
     color: u32,
     owner: u32,
     diameter: f32,
-    pad: f32,
+    slope_chain: f32,
     dz: f32,
 }
 @group(1) @binding(0) var<storage, read> path: array<PathVertex>;
@@ -139,7 +152,7 @@ struct Wire {
 
 struct Sweep {
     owner: u32,
-    planar: bool,
+    flags: u32,
     depth: f32,
 }
 
@@ -165,8 +178,8 @@ fn read_wire(pixel: vec2<i32>, index: i32) -> Wire {
 fn read_sweep(pixel: vec2<i32>, index: i32, ignore: u32) -> Sweep {
     let raw = textureLoad(sweeps, pixel, index);
     let owner = decode_owner(raw.rgb);
-    if owner == 0u || owner == ignore { return Sweep(0u, false, 1.0); }
-    return Sweep(owner, raw.a > 0.5, textureLoad(sweep_depth, pixel, index));
+    if owner == 0u || owner == ignore { return Sweep(0u, 0u, 1.0); }
+    return Sweep(owner, u32(round(raw.a * 255.0)), textureLoad(sweep_depth, pixel, index));
 }
 
 fn is_line(wire: Wire) -> bool { return wire.tag < 192u; }
@@ -266,13 +279,23 @@ struct HaloVertex {
     return wire_halo(near, far, dot(at - far.start.xy, far.direction));
 }
 
-fn sweep_separation(surface: Sweep, far: f32, correction: f32) -> f32 {
-    let gap = far - surface.depth + select(0.0, correction, surface.planar);
+fn sweep_separation(surface: Sweep, far: f32, correction: f32, receiver: u32) -> f32 {
+    let gap = far - surface.depth + select(0.0, correction, (surface.flags & SWEEP_PLANAR) != 0u);
     if gap <= 0.0 { return 0.0; }
+    // A stitched join belongs to both pieces. More distant parts of a run
+    // can still cross over one another and should retain their depth cue.
+    if ((surface.flags & SWEEP_PREVIOUS) != 0u && surface.owner == receiver + 1u) ||
+        ((surface.flags & SWEEP_NEXT) != 0u && surface.owner + 1u == receiver) { return 0.0; }
     var diameter = camera.depth_scale.y;
     if surface.owner < AXIS_FIRST {
-        let programmed = path[(surface.owner - 1u) * 2u].diameter;
+        let caster = path[(surface.owner - 1u) * 2u];
+        let programmed = caster.diameter;
         if programmed > 0.0 { diameter = programmed * camera.depth_scale.z; }
+        if gap <= diameter * 1.08 { return 0.0; }
+        // Subdividing a straight slope must not change how the disc sweep
+        // shades its own centreline or introduce edges between its pieces.
+        if caster.slope_chain != 0.0 && receiver > 0u && receiver < AXIS_FIRST &&
+            path[(receiver - 1u) * 2u].slope_chain == caster.slope_chain { return 0.0; }
     }
     // Nearby parts of the same-size footprint should stay readable. A visibly
     // separated upper pass can dim a lower path regardless of how it was programmed.
@@ -290,7 +313,7 @@ const SWEEP_TAPS = array<vec3<f32>, 12>(
 fn sweep_coverage(pixel: vec2<i32>, index: i32, owner: u32, far: f32, correction: f32) -> f32 {
     let edge = read_sweep(pixel, index, owner);
     if edge.owner == 0u { return 0.0; }
-    return sweep_separation(edge, far, correction);
+    return sweep_separation(edge, far, correction, owner);
 }
 
 @fragment fn fs_resolve(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
@@ -298,7 +321,7 @@ fn sweep_coverage(pixel: vec2<i32>, index: i32, owner: u32, far: f32, correction
     let show_sweep = camera.flags.w >= 2.0;
     let gradient = camera.xy_depth.xy * vec2(1.0, -1.0) * camera.xy_depth.z;
     let depth_bias = max(0.000001, 0.8 * length(gradient));
-    let no_sweep = Sweep(0u, false, 1.0);
+    let no_sweep = Sweep(0u, 0u, 1.0);
     var wire: array<Wire, 4>;
     var sweep: array<Sweep, 4>;
     var front_sweep = no_sweep;
@@ -327,7 +350,7 @@ fn sweep_coverage(pixel: vec2<i32>, index: i32, owner: u32, far: f32, correction
             let neighbor = clamp(pixel + vec2<i32>(round(tap.xy * dpi)), vec2(0), limit);
             let offset = vec2<f32>(neighbor - pixel);
             // Project a horizontal sweep's depth to the receiver's pixel.
-            let correction = select(0.0, dot(gradient, offset), front_sweep.planar);
+            let correction = select(0.0, dot(gradient, offset), (front_sweep.flags & SWEEP_PLANAR) != 0u);
             // The faint outer tail uses one sample, mirrored on opposing taps.
             if n >= 8 {
                 sweep_edge += tap.z * sweep_coverage(neighbor, (n % 2) * 3, front_sweep.owner, far, correction);
@@ -360,8 +383,9 @@ fn sweep_coverage(pixel: vec2<i32>, index: i32, owner: u32, far: f32, correction
             continue;
         }
         var ink = line.color;
-        if surface.owner != 0u && surface.owner != line.owner {
-            let separation = sweep_separation(surface, line.depth - depth_bias, 0.0);
+        let receiver = select(line.owner, u32(camera.depth_scale.w), line.owner == LIVE_SEGMENT);
+        if surface.owner != 0u && surface.owner != receiver {
+            let separation = sweep_separation(surface, line.depth - depth_bias, 0.0, receiver);
             ink = mix(ink, pigment, SWEEP_ALPHA * separation);
         }
         let gap = select(0.0, textureLoad(halos, pixel, i).r, is_line(line));
